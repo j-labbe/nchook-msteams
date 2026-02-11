@@ -328,12 +328,12 @@ def check_db_consistency(conn, persisted_rec_id):
 # Startup Summary
 # ---------------------------------------------------------------------------
 
-def print_startup_summary(db_path, last_rec_id):
+def print_startup_summary(db_path, last_rec_id, config=None):
     """
     Print formatted startup summary banner.
 
     Shows DB path, FDA status (always OK at this point since validation
-    passed), and last rec_id.
+    passed), last rec_id, and config details when available.
     """
     logging.info("=" * 60)
     logging.info("Teams Notification Interceptor")
@@ -341,6 +341,11 @@ def print_startup_summary(db_path, last_rec_id):
     logging.info("  DB path:     %s", db_path)
     logging.info("  FDA status:  OK")
     logging.info("  Last rec_id: %d", last_rec_id)
+    if config is not None:
+        logging.info("  Webhook URL: %s", config.get("webhook_url", "NOT SET"))
+        logging.info("  Bundle IDs:  %s", ", ".join(sorted(config.get("bundle_ids", []))))
+        logging.info("  Poll interval: %.1fs", config.get("poll_interval", POLL_FALLBACK_SECONDS))
+        logging.info("  Log level:   %s", config.get("log_level", "INFO"))
     logging.info("=" * 60)
 
 
@@ -612,17 +617,23 @@ def create_wal_watcher(wal_path):
 # Event Loop
 # ---------------------------------------------------------------------------
 
-def run_watcher(db_path, wal_path, state_path):
+def run_watcher(db_path, wal_path, state_path, config=None):
     """
     Main kqueue event loop that watches the WAL file for changes.
 
     Queries for new notifications on each kqueue event or poll timeout,
-    logs extracted fields, and persists state after each batch.
+    filters through the pipeline, builds payloads, and POSTs to webhook.
+    Persists state after each batch.
     Handles WAL file recreation gracefully (re-registers kqueue).
 
     Falls back to periodic polling when kqueue is unavailable.
     """
     global running
+
+    # Use config poll interval or fallback
+    poll_interval = POLL_FALLBACK_SECONDS
+    if config is not None:
+        poll_interval = config.get("poll_interval", POLL_FALLBACK_SECONDS)
 
     # Load persisted state
     last_rec_id = load_state(state_path)
@@ -639,7 +650,7 @@ def run_watcher(db_path, wal_path, state_path):
     last_rec_id = check_db_consistency(conn, last_rec_id)
 
     # Print startup banner
-    print_startup_summary(db_path, last_rec_id)
+    print_startup_summary(db_path, last_rec_id, config)
 
     # Set up kqueue if WAL exists
     kq = None
@@ -660,7 +671,7 @@ def run_watcher(db_path, wal_path, state_path):
 
             if kq is not None and kev is not None:
                 try:
-                    events = kq.control([kev], 1, POLL_FALLBACK_SECONDS)
+                    events = kq.control([kev], 1, poll_interval)
                     for ev in events:
                         if ev.fflags & (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME):
                             wal_was_deleted = True
@@ -668,13 +679,20 @@ def run_watcher(db_path, wal_path, state_path):
                     logging.warning("kqueue error (stale FD?): %s", e)
                     wal_was_deleted = True  # Treat as WAL gone, attempt re-register
             else:
-                time.sleep(POLL_FALLBACK_SECONDS)
+                time.sleep(poll_interval)
 
             # Query for new notifications
             notifications = query_new_notifications(conn, last_rec_id)
 
             for notif in notifications:
-                # Format timestamp as ISO 8601
+                if config is not None and not passes_filter(notif, config):
+                    logging.debug(
+                        "Filtered: app=%s title=%s body=%.50s",
+                        notif["app"], notif["title"], notif.get("body", ""),
+                    )
+                    continue
+
+                # Log the notification (keep Phase 1 behavior for non-config mode)
                 if notif["timestamp"] > 0:
                     ts_str = time.strftime(
                         "%Y-%m-%dT%H:%M:%S",
@@ -691,6 +709,16 @@ def run_watcher(db_path, wal_path, state_path):
                     notif["body"],
                     ts_str,
                 )
+
+                # Webhook delivery (only if config with webhook_url)
+                if config is not None and config.get("webhook_url"):
+                    msg_type = classify_notification(notif)
+                    payload = build_webhook_payload(notif, msg_type)
+                    post_webhook(
+                        payload,
+                        config["webhook_url"],
+                        config.get("webhook_timeout", 10),
+                    )
 
             # Update high-water mark
             if notifications:
@@ -758,11 +786,19 @@ def run_watcher(db_path, wal_path, state_path):
 
 def main():
     """
-    CLI entry point: validate environment and start the event loop.
+    CLI entry point: load config, validate environment, and start the event loop.
 
-    Detects DB path, validates FDA, then enters the kqueue event loop.
-    Handles KeyboardInterrupt for clean shutdown.
+    Loads config first, sets log level, detects DB path, validates FDA,
+    then enters the kqueue event loop with the full filter-classify-build-post
+    pipeline. Handles KeyboardInterrupt for clean shutdown.
     """
+    config = load_config()
+
+    # Set log level from config
+    logging.getLogger().setLevel(
+        getattr(logging, config.get("log_level", "INFO").upper(), logging.INFO)
+    )
+
     db_path, wal_path = detect_db_path()
 
     # Validate environment (FDA, schema) -- returns a connection we don't need
@@ -770,7 +806,7 @@ def main():
     validation_conn.close()
 
     try:
-        run_watcher(db_path, wal_path, STATE_FILE)
+        run_watcher(db_path, wal_path, STATE_FILE, config)
     except KeyboardInterrupt:
         logging.info("Shutting down...")
 
