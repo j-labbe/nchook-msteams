@@ -10,18 +10,18 @@ See: .planning/PROJECT.md (updated 2026-02-11)
 ## Current Position
 
 Phase: 4 of 6 (Status Detection Core)
-Plan: 0 of ? in current phase
-Status: Ready to plan
-Last activity: 2026-02-11 -- v1.1 roadmap created (3 phases, 16 requirements)
+Plan: 1 of 1 in current phase -- COMPLETE
+Status: Phase 4 complete
+Last activity: 2026-02-11 -- Phase 4 status detection core executed
 
-Progress: [█████░░░░░] 50% (5/10 plans across all milestones; v1.1: 0%)
+Progress: [██████░░░░] 60% (6/10 plans across all milestones; v1.1: 33%)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 5
-- Average duration: 5.0min
-- Total execution time: 0.42 hours
+- Total plans completed: 6
+- Average duration: 4.7min
+- Total execution time: 0.47 hours
 
 **By Phase:**
 
@@ -30,6 +30,7 @@ Progress: [█████░░░░░] 50% (5/10 plans across all milestones
 | 01-db-watcher-state-engine | 2/2 | 15min | 7.5min |
 | 02-teams-filtering-webhook-delivery | 2/2 | 5min | 2.5min |
 | 03-operational-hardening | 1/1 | 3min | 3.0min |
+| 04-status-detection-core | 1/1 | 3min | 3.0min |
 
 ## Accumulated Context
 
@@ -40,6 +41,9 @@ Recent decisions affecting current work:
 
 - [v1.1 roadmap]: Three phases (4-6) derived from 16 requirements. Phase 7 (hardening) dropped -- all hardening items are v2 deferred.
 - [v1.1 roadmap]: AX discovery isolated in Phase 6 because research flags it as high-risk (new Teams AX tree may be broken). Phases 4-5 deliver value without AX.
+- [Phase 4]: MSTeams checked before "Microsoft Teams" in process detection for new Teams binary compatibility
+- [Phase 4]: Signal functions return None on failure; orchestrator handles fallthrough (no exception propagation)
+- [Phase 4]: idle_threshold_seconds config param (default 300) added now to avoid code changes in Phase 5
 
 ### Pending Todos
 
@@ -52,5 +56,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-11
-Stopped at: v1.1 roadmap created -- Phase 4 ready to plan
+Stopped at: Completed 04-01-PLAN.md -- Phase 4 complete, ready for Phase 5
 Resume file: None
