@@ -14,7 +14,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: DB Watcher & State Engine** - Patched nchook that reliably watches Sequoia DB, extracts all fields, persists state, and validates the environment
 - [x] **Phase 2: Teams Filtering & Webhook Delivery** - Wrapper that filters to Teams messages, constructs JSON payloads, and delivers to webhook
-- [ ] **Phase 3: Operational Hardening** - Graceful shutdown, dry-run mode, and end-to-end production readiness
+- [x] **Phase 3: Operational Hardening** - Graceful shutdown, dry-run mode, and end-to-end production readiness
 
 ## Phase Details
 
@@ -61,7 +61,7 @@ Plans:
 **Plans**: 1 plan
 
 Plans:
-- [ ] 03-01-PLAN.md -- Graceful signal handling, --dry-run CLI flag, post-loop state flush
+- [x] 03-01-PLAN.md -- Graceful signal handling, --dry-run CLI flag, post-loop state flush
 
 ## Progress
 
@@ -72,4 +72,4 @@ Phases execute in numeric order: 1 -> 2 -> 3
 |-------|----------------|--------|-----------|
 | 1. DB Watcher & State Engine | 2/2 | Complete | 2026-02-11 |
 | 2. Teams Filtering & Webhook Delivery | 2/2 | Complete | 2026-02-11 |
-| 3. Operational Hardening | 0/1 | Not started | - |
+| 3. Operational Hardening | 1/1 | Complete | 2026-02-11 |
