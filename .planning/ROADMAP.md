@@ -36,11 +36,10 @@
   3. Running `detect_user_status()` when user is active and Teams is running returns status=Available, source=idle, confidence=medium
   4. Every status result dict contains detected_status, status_source, and status_confidence fields
   5. A subprocess timeout on any signal does not crash the daemon -- the chain falls through to the next signal
-**Plans**: TBD
+**Plans**: 1 plan
 
 Plans:
-- [ ] 04-01: TBD
-- [ ] 04-02: TBD
+- [ ] 04-01-PLAN.md -- Signal functions (idle, process, AX stub) and fallback chain orchestrator
 
 ### Phase 5: Config, Gating, and Event Loop Integration
 **Goal**: Daemon uses detected status to gate notification forwarding -- forwarding on Away/Busy, suppressing on Available/Offline -- with config toggle, payload metadata, and correct rec_id advancement
@@ -81,6 +80,6 @@ Plans:
 | 1. DB Watcher & State Engine | v1.0 | 2/2 | Complete | 2026-02-11 |
 | 2. Teams Filtering & Webhook Delivery | v1.0 | 2/2 | Complete | 2026-02-11 |
 | 3. Operational Hardening | v1.0 | 1/1 | Complete | 2026-02-11 |
-| 4. Status Detection Core | v1.1 | 0/? | Not started | - |
+| 4. Status Detection Core | v1.1 | 0/1 | Not started | - |
 | 5. Config, Gating, and Event Loop Integration | v1.1 | 0/? | Not started | - |
 | 6. AX Discovery and Permission Handling | v1.1 | 0/? | Not started | - |
