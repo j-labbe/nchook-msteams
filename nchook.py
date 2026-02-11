@@ -335,12 +335,12 @@ def check_db_consistency(conn, persisted_rec_id):
 # Startup Summary
 # ---------------------------------------------------------------------------
 
-def print_startup_summary(db_path, last_rec_id, config=None):
+def print_startup_summary(db_path, last_rec_id, config=None, dry_run=False):
     """
     Print formatted startup summary banner.
 
     Shows DB path, FDA status (always OK at this point since validation
-    passed), last rec_id, and config details when available.
+    passed), last rec_id, config details, and dry-run mode indicator.
     """
     logging.info("=" * 60)
     logging.info("Teams Notification Interceptor")
@@ -353,6 +353,8 @@ def print_startup_summary(db_path, last_rec_id, config=None):
         logging.info("  Bundle IDs:  %s", ", ".join(sorted(config.get("bundle_ids", []))))
         logging.info("  Poll interval: %.1fs", config.get("poll_interval", POLL_FALLBACK_SECONDS))
         logging.info("  Log level:   %s", config.get("log_level", "INFO"))
+    if dry_run:
+        logging.info("  Mode:        DRY-RUN (no HTTP requests)")
     logging.info("=" * 60)
 
 
@@ -624,7 +626,7 @@ def create_wal_watcher(wal_path):
 # Event Loop
 # ---------------------------------------------------------------------------
 
-def run_watcher(db_path, wal_path, state_path, config=None):
+def run_watcher(db_path, wal_path, state_path, config=None, dry_run=False):
     """
     Main kqueue event loop that watches the WAL file for changes.
 
@@ -657,7 +659,7 @@ def run_watcher(db_path, wal_path, state_path, config=None):
     last_rec_id = check_db_consistency(conn, last_rec_id)
 
     # Print startup banner
-    print_startup_summary(db_path, last_rec_id, config)
+    print_startup_summary(db_path, last_rec_id, config, dry_run=dry_run)
 
     # Set up kqueue if WAL exists
     kq = None
@@ -721,11 +723,18 @@ def run_watcher(db_path, wal_path, state_path, config=None):
                 if config is not None and config.get("webhook_url"):
                     msg_type = classify_notification(notif)
                     payload = build_webhook_payload(notif, msg_type)
-                    post_webhook(
-                        payload,
-                        config["webhook_url"],
-                        config.get("webhook_timeout", 10),
-                    )
+                    if dry_run:
+                        logging.info(
+                            "DRY-RUN | Would POST to %s:\n%s",
+                            config["webhook_url"],
+                            json.dumps(payload, indent=2),
+                        )
+                    else:
+                        post_webhook(
+                            payload,
+                            config["webhook_url"],
+                            config.get("webhook_timeout", 10),
+                        )
 
             # Update high-water mark
             if notifications:
@@ -798,12 +807,22 @@ def run_watcher(db_path, wal_path, state_path, config=None):
 
 def main():
     """
-    CLI entry point: load config, validate environment, and start the event loop.
+    CLI entry point: parse args, load config, validate environment, start event loop.
 
-    Loads config first, sets log level, detects DB path, validates FDA,
-    then enters the kqueue event loop with the full filter-classify-build-post
-    pipeline. Handles KeyboardInterrupt for clean shutdown.
+    Parses --dry-run flag first (so --help works without config.json), loads
+    config, sets log level, detects DB path, validates FDA, then enters the
+    kqueue event loop. Handles KeyboardInterrupt for clean shutdown.
     """
+    parser = argparse.ArgumentParser(
+        description="macOS Teams Notification Interceptor"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Log webhook payloads without sending HTTP requests",
+    )
+    args = parser.parse_args()
+
     config = load_config()
 
     # Set log level from config
@@ -821,7 +840,7 @@ def main():
     signal.signal(signal.SIGTERM, _shutdown_handler)
 
     try:
-        run_watcher(db_path, wal_path, STATE_FILE, config)
+        run_watcher(db_path, wal_path, STATE_FILE, config, dry_run=args.dry_run)
     except KeyboardInterrupt:
         logging.info("Shutting down...")
 
