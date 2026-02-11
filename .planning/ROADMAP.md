@@ -65,10 +65,10 @@ Plans:
   2. Raw AX status text (e.g., "Be Right Back", "Do not disturb") is normalized to canonical values (BeRightBack, DoNotDisturb, etc.)
   3. Without Accessibility permission, startup logs actionable instructions for granting permission to the correct terminal application
   4. When AX signal fails or permission is denied, the daemon silently falls back to idle+process detection without user intervention
-**Plans**: TBD
+**Plans**: 1 plan
 
 Plans:
-- [ ] 06-01: TBD
+- [ ] 06-01-PLAN.md -- AX permission probe, AppleScript status query, startup instructions, and self-disable safety net
 
 ## Progress
 
@@ -81,4 +81,4 @@ Plans:
 | 3. Operational Hardening | v1.0 | 1/1 | Complete | 2026-02-11 |
 | 4. Status Detection Core | v1.1 | 1/1 | Complete | 2026-02-11 |
 | 5. Config, Gating, and Event Loop Integration | v1.1 | 1/1 | Complete | 2026-02-11 |
-| 6. AX Discovery and Permission Handling | v1.1 | 0/? | Not started | - |
+| 6. AX Discovery and Permission Handling | v1.1 | 0/1 | Not started | - |
