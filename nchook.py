@@ -751,8 +751,110 @@ def _detect_teams_process():
 
 
 def _detect_status_ax():
-    """Placeholder for AX status detection (Phase 6). Always returns None."""
-    return None
+    """
+    STAT-03: Read Teams status text from Accessibility tree via osascript.
+
+    Returns raw status text string (e.g., "Busy", "Away") or None on failure.
+    None causes the fallback chain in detect_user_status() to proceed to
+    idle+process signals. Never raises exceptions.
+
+    Permission gate: skips osascript entirely if AX permission not granted
+    (cached at startup via _ax_available).
+
+    Safety net: after _AX_MAX_FAILURES consecutive failures, self-disables
+    for the remainder of the session to avoid wasting 3s per poll cycle on
+    a broken AX tree.
+    """
+    global _ax_available, _ax_consecutive_failures
+
+    # Fast path: AX not available (permission denied or self-disabled)
+    if _ax_available is None:
+        _ax_available = _check_ax_permission()
+    if not _ax_available:
+        return None
+
+    # AppleScript to read Teams status via System Events.
+    # Tries two candidate paths:
+    # 1. Menu bar item description (Teams menu bar extension, late 2024+)
+    # 2. First static text of the main window (legacy fallback)
+    # The script returns the first non-empty result or empty string.
+    script = '''
+try
+    tell application "System Events"
+        tell process "MSTeams"
+            -- Candidate 1: Menu bar extension status (most promising for new Teams)
+            try
+                set statusText to description of menu bar item 1 of menu bar 2
+                if statusText is not "" and statusText is not missing value then
+                    return statusText
+                end if
+            end try
+            -- Candidate 2: Window title or status area
+            try
+                set statusText to value of static text 1 of group 1 of group 1 of window 1
+                if statusText is not "" and statusText is not missing value then
+                    return statusText
+                end if
+            end try
+        end tell
+    end tell
+    return ""
+on error errMsg number errNum
+    return ""
+end try
+'''
+
+    try:
+        result = subprocess.run(
+            ['osascript', '-e', script],
+            capture_output=True,
+            text=True,
+            timeout=3,  # Must be < poll_interval (5s) to avoid blocking event loop
+        )
+        if result.returncode != 0:
+            logging.debug("AX query error (exit %d): %s",
+                         result.returncode, result.stderr.strip())
+            _ax_consecutive_failures += 1
+            if _ax_consecutive_failures >= _AX_MAX_FAILURES:
+                logging.info(
+                    "AX query failed %d consecutive times; disabling AX for this session. "
+                    "Falling back to idle+process signals.",
+                    _ax_consecutive_failures,
+                )
+                _ax_available = False
+            return None
+
+        raw = result.stdout.strip()
+        if not raw:
+            _ax_consecutive_failures += 1
+            if _ax_consecutive_failures >= _AX_MAX_FAILURES:
+                logging.info(
+                    "AX query returned empty %d consecutive times; disabling AX for this session. "
+                    "Falling back to idle+process signals.",
+                    _ax_consecutive_failures,
+                )
+                _ax_available = False
+            return None
+
+        # Success -- reset failure counter and return raw text
+        _ax_consecutive_failures = 0
+        return raw
+
+    except subprocess.TimeoutExpired:
+        logging.debug("AX query timed out (3s)")
+        _ax_consecutive_failures += 1
+        if _ax_consecutive_failures >= _AX_MAX_FAILURES:
+            logging.info(
+                "AX query timed out %d consecutive times; disabling AX for this session. "
+                "Falling back to idle+process signals.",
+                _ax_consecutive_failures,
+            )
+            _ax_available = False
+        return None
+    except FileNotFoundError:
+        logging.debug("osascript not found")
+        _ax_available = False  # Permanent: no osascript means no AX ever
+        return None
 
 
 _AX_STATUS_MAP = {
