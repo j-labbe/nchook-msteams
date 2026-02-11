@@ -1,0 +1,7 @@
+{
+    "webhook_url": "https://example.com/webhook",
+    "bundle_ids": ["com.microsoft.teams2", "com.microsoft.teams"],
+    "poll_interval": 5.0,
+    "log_level": "INFO",
+    "webhook_timeout": 10
+}

@@ -22,6 +22,9 @@ import select
 import signal
 import subprocess
 import argparse
+import urllib.request
+import urllib.error
+import re
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -339,6 +342,188 @@ def print_startup_summary(db_path, last_rec_id):
     logging.info("  FDA status:  OK")
     logging.info("  Last rec_id: %d", last_rec_id)
     logging.info("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CONFIG_FILE = "config.json"
+
+DEFAULT_CONFIG = {
+    "bundle_ids": ["com.microsoft.teams2", "com.microsoft.teams"],
+    "poll_interval": 5.0,
+    "log_level": "INFO",
+    "webhook_timeout": 10,
+}
+
+
+def load_config(config_path=None):
+    """
+    Load JSON config file with defaults. Exits if file missing or invalid.
+
+    Resolves config_path relative to the script's directory if not provided,
+    ensuring the daemon finds config.json regardless of CWD.
+
+    Validates that webhook_url is present and non-empty.
+    Converts bundle_ids list to a set for O(1) lookup.
+
+    Returns the merged config dict.
+    """
+    if config_path is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(script_dir, CONFIG_FILE)
+
+    config = dict(DEFAULT_CONFIG)
+
+    try:
+        with open(config_path, "r") as f:
+            user_config = json.load(f)
+    except FileNotFoundError:
+        logging.error("Config file not found: %s", config_path)
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        logging.error("Config file invalid JSON: %s", e)
+        sys.exit(1)
+
+    config.update(user_config)
+
+    if "webhook_url" not in config or not config["webhook_url"]:
+        logging.error("Config missing required field: webhook_url")
+        sys.exit(1)
+
+    # Convert bundle_ids to set for O(1) lookup
+    config["bundle_ids"] = set(config["bundle_ids"])
+
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Teams Filtering
+# ---------------------------------------------------------------------------
+
+# Known noise patterns in Teams notification body text (English locale).
+# These are notification types that are NOT real chat messages.
+NOISE_PATTERNS = [
+    # Reactions
+    "Liked",
+    "Loved",
+    "Laughed at",
+    "Was surprised by",
+    "Was sad at",
+    # Call notifications
+    "is calling you",
+    "Missed call from",
+    "Incoming call",
+    # Meeting notifications
+    "joined the meeting",
+    "left the meeting",
+    "Meeting started",
+    "is presenting",
+    # Join/leave events
+    "has been added",
+    "has left",
+    "has joined",
+    # Typing indicators (if they surface as notifications)
+    "is typing",
+]
+
+# Sentence-ending punctuation that suggests a message is complete (not truncated)
+SENTENCE_ENDINGS = frozenset(".!?\"')")
+
+
+def passes_bundle_id_filter(notif, bundle_ids):
+    """FILT-01: Only Teams bundle IDs pass."""
+    return notif["app"] in bundle_ids
+
+
+def passes_allowlist_filter(notif):
+    """FILT-02: Require both sender (title) and body to be present and non-empty."""
+    return bool(notif.get("title", "").strip()) and bool(notif.get("body", "").strip())
+
+
+def is_system_alert(notif):
+    """FILT-03: Reject notifications where title is 'Microsoft Teams'."""
+    return notif.get("title", "").strip() == "Microsoft Teams"
+
+
+def is_noise_notification(body, title):
+    """FILT-04: Reject known noise patterns in body text."""
+    body_stripped = body.strip()
+    for pattern in NOISE_PATTERNS:
+        if body_stripped.startswith(pattern) or body_stripped == pattern:
+            return True
+    return False
+
+
+def passes_filter(notif, config):
+    """
+    Complete four-stage filter chain.
+
+    Stage 1: Bundle ID match (FILT-01)
+    Stage 2: Allowlist -- require sender and body (FILT-02)
+    Stage 3: System alert rejection (FILT-03)
+    Stage 4: Noise pattern rejection (FILT-04)
+
+    Returns True if notification passes all stages.
+    """
+    if not passes_bundle_id_filter(notif, config["bundle_ids"]):
+        return False
+    if not passes_allowlist_filter(notif):
+        return False
+    if is_system_alert(notif):
+        return False
+    if is_noise_notification(notif.get("body", ""), notif.get("title", "")):
+        return False
+    return True
+
+
+def classify_notification(notif):
+    """
+    FILT-05: Classify notification type based on content and subtitle patterns.
+
+    Returns one of: "direct_message", "channel_message", "mention"
+
+    Heuristic (English locale):
+    - Body contains "@" -> mention
+    - Subtitle contains "|" or ">" separator -> channel_message
+    - Subtitle present and differs from title -> channel_message
+    - Default: direct_message
+    """
+    subtitle = notif.get("subtitle", "").strip()
+    body = notif.get("body", "")
+
+    # Check for @mention patterns in body
+    if "@" in body:
+        return "mention"
+
+    # Subtitle with separator pattern indicates channel message
+    if subtitle and ("|" in subtitle or ">" in subtitle):
+        return "channel_message"
+
+    # Subtitle present and differs from title indicates group/channel context
+    title = notif.get("title", "").strip()
+    if subtitle and subtitle != title:
+        return "channel_message"
+
+    # Default: direct message
+    return "direct_message"
+
+
+def detect_truncation(body):
+    """
+    WEBH-04: Detect likely truncated messages.
+
+    Heuristic: body is >= 150 characters AND does not end with sentence-ending
+    punctuation. macOS notification preview truncates long messages at approximately
+    150 characters without adding an ellipsis.
+
+    Returns True if likely truncated, False otherwise.
+    """
+    if len(body) < 150:
+        return False
+    if body and body[-1] in SENTENCE_ENDINGS:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
