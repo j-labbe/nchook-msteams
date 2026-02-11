@@ -37,6 +37,10 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 COCOA_TO_UNIX_OFFSET = 978307200  # seconds between Unix epoch (1970) and Cocoa epoch (2001)
 STATE_FILE = "state.json"
+POLL_FALLBACK_SECONDS = 5.0  # fallback poll interval when kqueue misses events
+
+# Module-level flag for event loop control (signal handlers in Phase 3 will set False)
+running = True
 
 # ---------------------------------------------------------------------------
 # DB Path Detection
@@ -335,3 +339,198 @@ def print_startup_summary(db_path, last_rec_id):
     logging.info("  FDA status:  OK")
     logging.info("  Last rec_id: %d", last_rec_id)
     logging.info("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# kqueue WAL Watcher
+# ---------------------------------------------------------------------------
+
+def create_wal_watcher(wal_path):
+    """
+    Create a kqueue watcher on the WAL file.
+
+    Monitors for WRITE (new data), DELETE, and RENAME events.
+    DELETE/RENAME happen when SQLite checkpoints the WAL.
+
+    Returns (kq, fd, kevent) tuple.
+    """
+    kq = select.kqueue()
+    fd = os.open(wal_path, os.O_RDONLY)
+    kev = select.kevent(
+        fd,
+        filter=select.KQ_FILTER_VNODE,
+        flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_CLEAR,
+        fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME,
+    )
+    return (kq, fd, kev)
+
+
+# ---------------------------------------------------------------------------
+# Event Loop
+# ---------------------------------------------------------------------------
+
+def run_watcher(db_path, wal_path, state_path):
+    """
+    Main kqueue event loop that watches the WAL file for changes.
+
+    Queries for new notifications on each kqueue event or poll timeout,
+    logs extracted fields, and persists state after each batch.
+    Handles WAL file recreation gracefully (re-registers kqueue).
+
+    Falls back to periodic polling when kqueue is unavailable.
+    """
+    global running
+
+    # Load persisted state
+    last_rec_id = load_state(state_path)
+
+    # Open DB read-only
+    conn = sqlite3.connect(
+        f"file:{db_path}?mode=ro",
+        uri=True,
+        timeout=5.0,
+    )
+    conn.row_factory = sqlite3.Row
+
+    # Check DB consistency (detect purges)
+    last_rec_id = check_db_consistency(conn, last_rec_id)
+
+    # Print startup banner
+    print_startup_summary(db_path, last_rec_id)
+
+    # Set up kqueue if WAL exists
+    kq = None
+    fd = None
+    kev = None
+    if os.path.exists(wal_path):
+        try:
+            kq, fd, kev = create_wal_watcher(wal_path)
+            logging.info("Watching WAL file via kqueue: %s", wal_path)
+        except OSError as e:
+            logging.warning("Failed to set up kqueue on WAL: %s. Using poll-only mode.", e)
+    else:
+        logging.warning("WAL file not found: %s. Using poll-only mode.", wal_path)
+
+    try:
+        while running:
+            wal_was_deleted = False
+
+            if kq is not None and kev is not None:
+                try:
+                    events = kq.control([kev], 1, POLL_FALLBACK_SECONDS)
+                    for ev in events:
+                        if ev.fflags & (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME):
+                            wal_was_deleted = True
+                except OSError as e:
+                    logging.warning("kqueue error (stale FD?): %s", e)
+                    wal_was_deleted = True  # Treat as WAL gone, attempt re-register
+            else:
+                time.sleep(POLL_FALLBACK_SECONDS)
+
+            # Query for new notifications
+            notifications = query_new_notifications(conn, last_rec_id)
+
+            for notif in notifications:
+                # Format timestamp as ISO 8601
+                if notif["timestamp"] > 0:
+                    ts_str = time.strftime(
+                        "%Y-%m-%dT%H:%M:%S",
+                        time.gmtime(notif["timestamp"]),
+                    )
+                else:
+                    ts_str = "unknown"
+
+                logging.info(
+                    "Notification | app=%s | title=%s | subtitle=%s | body=%s | time=%s",
+                    notif["app"],
+                    notif["title"],
+                    notif["subtitle"],
+                    notif["body"],
+                    ts_str,
+                )
+
+            # Update high-water mark
+            if notifications:
+                last_rec_id = notifications[-1]["rec_id"]
+                save_state(last_rec_id, state_path)
+
+            # Handle WAL delete/rename: re-register kqueue if WAL reappears
+            if wal_was_deleted and os.path.exists(wal_path):
+                # Close old FD
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                # Close old kqueue
+                if kq is not None:
+                    try:
+                        kq.close()
+                    except OSError:
+                        pass
+                # Re-register
+                try:
+                    kq, fd, kev = create_wal_watcher(wal_path)
+                    logging.info("Re-registered kqueue on new WAL file.")
+                except OSError as e:
+                    logging.warning(
+                        "Failed to re-register kqueue: %s. Falling back to polling.", e
+                    )
+                    kq = None
+                    fd = None
+                    kev = None
+            elif wal_was_deleted and not os.path.exists(wal_path):
+                logging.warning("WAL file deleted and not yet recreated. Falling back to polling.")
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                if kq is not None:
+                    try:
+                        kq.close()
+                    except OSError:
+                        pass
+                kq = None
+                fd = None
+                kev = None
+    finally:
+        # Clean up resources
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if kq is not None:
+            try:
+                kq.close()
+            except OSError:
+                pass
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI Entry Point
+# ---------------------------------------------------------------------------
+
+def main():
+    """
+    CLI entry point: validate environment and start the event loop.
+
+    Detects DB path, validates FDA, then enters the kqueue event loop.
+    Handles KeyboardInterrupt for clean shutdown.
+    """
+    db_path, wal_path = detect_db_path()
+
+    # Validate environment (FDA, schema) -- returns a connection we don't need
+    validation_conn = validate_environment(db_path)
+    validation_conn.close()
+
+    try:
+        run_watcher(db_path, wal_path, STATE_FILE)
+    except KeyboardInterrupt:
+        logging.info("Shutting down...")
+
+
+if __name__ == "__main__":
+    main()
