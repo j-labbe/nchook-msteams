@@ -83,35 +83,35 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| DBWT-01 | — | Pending |
-| DBWT-02 | — | Pending |
-| DBWT-03 | — | Pending |
-| DBWT-04 | — | Pending |
-| DBWT-05 | — | Pending |
-| DBWT-06 | — | Pending |
-| FILT-01 | — | Pending |
-| FILT-02 | — | Pending |
-| FILT-03 | — | Pending |
-| FILT-04 | — | Pending |
-| FILT-05 | — | Pending |
-| WEBH-01 | — | Pending |
-| WEBH-02 | — | Pending |
-| WEBH-03 | — | Pending |
-| WEBH-04 | — | Pending |
-| CONF-01 | — | Pending |
-| CONF-02 | — | Pending |
-| CONF-03 | — | Pending |
-| CONF-04 | — | Pending |
-| OPER-01 | — | Pending |
-| OPER-02 | — | Pending |
-| OPER-03 | — | Pending |
-| OPER-04 | — | Pending |
+| DBWT-01 | Phase 1 | Pending |
+| DBWT-02 | Phase 1 | Pending |
+| DBWT-03 | Phase 1 | Pending |
+| DBWT-04 | Phase 1 | Pending |
+| DBWT-05 | Phase 1 | Pending |
+| DBWT-06 | Phase 1 | Pending |
+| FILT-01 | Phase 2 | Pending |
+| FILT-02 | Phase 2 | Pending |
+| FILT-03 | Phase 2 | Pending |
+| FILT-04 | Phase 2 | Pending |
+| FILT-05 | Phase 2 | Pending |
+| WEBH-01 | Phase 2 | Pending |
+| WEBH-02 | Phase 2 | Pending |
+| WEBH-03 | Phase 2 | Pending |
+| WEBH-04 | Phase 2 | Pending |
+| CONF-01 | Phase 2 | Pending |
+| CONF-02 | Phase 1 | Pending |
+| CONF-03 | Phase 1 | Pending |
+| CONF-04 | Phase 1 | Pending |
+| OPER-01 | Phase 1 | Pending |
+| OPER-02 | Phase 1 | Pending |
+| OPER-03 | Phase 3 | Pending |
+| OPER-04 | Phase 3 | Pending |
 
 **Coverage:**
 - v1 requirements: 23 total
-- Mapped to phases: 0
-- Unmapped: 23
+- Mapped to phases: 23
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-02-11*
-*Last updated: 2026-02-11 after initial definition*
+*Last updated: 2026-02-11 after roadmap creation*
