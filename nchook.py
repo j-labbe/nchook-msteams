@@ -886,6 +886,21 @@ def run_watcher(db_path, wal_path, state_path, config=None, dry_run=False):
             else:
                 time.sleep(poll_interval)
 
+            # --- Status gating (GATE-04: once per poll cycle) ---
+            status_enabled = config.get("status_enabled", True) if config else False
+            if status_enabled:
+                status_result = detect_user_status(config)
+                forward = should_forward_status(status_result, config)
+                if not forward:
+                    logging.debug(
+                        "Status gate: suppressing (status=%s, source=%s)",
+                        status_result["detected_status"],
+                        status_result["status_source"],
+                    )
+            else:
+                status_result = None
+                forward = True
+
             # Query for new notifications
             notifications = query_new_notifications(conn, last_rec_id)
 
@@ -895,6 +910,9 @@ def run_watcher(db_path, wal_path, state_path, config=None, dry_run=False):
                         "Filtered: app=%s title=%s body=%.50s",
                         notif["app"], notif["title"], notif.get("body", ""),
                     )
+                    continue
+
+                if not forward:
                     continue
 
                 # Log the notification (keep Phase 1 behavior for non-config mode)
@@ -918,7 +936,7 @@ def run_watcher(db_path, wal_path, state_path, config=None, dry_run=False):
                 # Webhook delivery (only if config with webhook_url)
                 if config is not None and config.get("webhook_url"):
                     msg_type = classify_notification(notif)
-                    payload = build_webhook_payload(notif, msg_type)
+                    payload = build_webhook_payload(notif, msg_type, status_result)
                     if dry_run:
                         logging.info(
                             "DRY-RUN | Would POST to %s:\n%s",
@@ -931,6 +949,15 @@ def run_watcher(db_path, wal_path, state_path, config=None, dry_run=False):
                             config["webhook_url"],
                             config.get("webhook_timeout", 10),
                         )
+
+            # Batch suppression summary (INFO-level operational visibility)
+            if not forward and notifications:
+                suppressed = sum(1 for n in notifications if config is None or passes_filter(n, config))
+                if suppressed:
+                    logging.info(
+                        "Status gate: suppressed %d notification(s) (status=%s)",
+                        suppressed, status_result["detected_status"],
+                    )
 
             # Update high-water mark
             if notifications:
