@@ -527,6 +527,64 @@ def detect_truncation(body):
 
 
 # ---------------------------------------------------------------------------
+# Webhook Delivery
+# ---------------------------------------------------------------------------
+
+def build_webhook_payload(notif, msg_type):
+    """
+    WEBH-02, DBWT-06: Build JSON-serializable webhook payload from notification.
+
+    Returns dict with: senderName, chatId, content, timestamp, type,
+    subtitle, _source, _truncated.
+    """
+    ts = notif.get("timestamp", 0)
+    if ts > 0:
+        ts_formatted = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+    else:
+        ts_formatted = None
+
+    return {
+        "senderName": notif.get("title", ""),
+        "chatId": notif.get("subtitle", ""),
+        "content": notif.get("body", ""),
+        "timestamp": ts_formatted,
+        "type": msg_type,
+        "subtitle": notif.get("subtitle", ""),
+        "_source": "macos-notification-center",
+        "_truncated": detect_truncation(notif.get("body", "")),
+    }
+
+
+def post_webhook(payload, webhook_url, timeout=10):
+    """
+    WEBH-01, WEBH-03: POST JSON payload to webhook URL.
+
+    Returns True on success, False on any failure.
+    Never raises -- all exceptions are logged and skipped.
+    """
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        logging.info("Webhook delivered: HTTP %d (%d bytes sent)", resp.status, len(data))
+        return True
+    except urllib.error.HTTPError as e:
+        logging.warning("Webhook HTTP error: %d %s (url=%s)", e.code, e.reason, webhook_url)
+    except urllib.error.URLError as e:
+        logging.warning("Webhook connection error: %s (url=%s)", e.reason, webhook_url)
+    except TimeoutError:
+        logging.warning("Webhook timed out after %ds (url=%s)", timeout, webhook_url)
+    except Exception as e:
+        logging.warning("Webhook unexpected error: %s (url=%s)", str(e), webhook_url)
+    return False
+
+
+# ---------------------------------------------------------------------------
 # kqueue WAL Watcher
 # ---------------------------------------------------------------------------
 
