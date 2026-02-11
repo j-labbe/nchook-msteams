@@ -5,33 +5,34 @@
 See: .planning/PROJECT.md (updated 2026-02-11)
 
 **Core value:** Reliably capture every Teams message notification and deliver it as structured JSON to a webhook -- no missed messages, no noise.
-**Current focus:** Phase 1: DB Watcher & State Engine
+**Current focus:** Phase 2: Teams Filtering & Webhook Delivery
 
 ## Current Position
 
-Phase: 1 of 3 (DB Watcher & State Engine) -- COMPLETE
-Plan: 2 of 2 in current phase
-Status: Phase Complete
-Last activity: 2026-02-11 -- Completed 01-02-PLAN.md
+Phase: 2 of 3 (Teams Filtering & Webhook Delivery)
+Plan: 1 of 2 in current phase
+Status: In Progress
+Last activity: 2026-02-11 -- Completed 02-01-PLAN.md
 
-Progress: [#####.....] 50%
+Progress: [######....] 60%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2
-- Average duration: 7.5min
-- Total execution time: 0.25 hours
+- Total plans completed: 3
+- Average duration: 5.7min
+- Total execution time: 0.28 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-db-watcher-state-engine | 2/2 | 15min | 7.5min |
+| 02-teams-filtering-webhook-delivery | 1/2 | 2min | 2min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (3min), 01-02 (12min)
-- Trend: Normal
+- Last 5 plans: 01-01 (3min), 01-02 (12min), 02-01 (2min)
+- Trend: Fast
 
 *Updated after each plan completion*
 
@@ -52,6 +53,10 @@ Recent decisions affecting current work:
 - [01-02]: 5-second fallback poll interval balances responsiveness with CPU usage
 - [01-02]: kqueue re-registration on WAL delete/rename handles SQLite checkpoint edge case
 - [01-02]: Logging setup kept at module level rather than in main()
+- [02-01]: Config resolved relative to script dir (not CWD) for daemon portability
+- [02-01]: Bundle IDs converted to set at load time for O(1) filter lookup
+- [02-01]: Noise patterns use startswith/equals matching (not regex) for v1 simplicity
+- [02-01]: urllib imports added now to avoid Plan 02 touching the import block
 
 ### Pending Todos
 
@@ -64,5 +69,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-11
-Stopped at: Completed 01-02-PLAN.md (event loop, CLI entry point -- Phase 1 complete)
+Stopped at: Completed 02-01-PLAN.md (config loading, Teams filtering functions)
 Resume file: None
