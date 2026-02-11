@@ -5,13 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-02-11)
 
 **Core value:** Reliably capture every Teams message notification and deliver it as structured JSON to a webhook -- no missed messages, no noise.
-**Current focus:** v1.0 shipped. Planning next milestone.
+**Current focus:** v1.1 Teams Status Integration -- defining requirements
 
 ## Current Position
 
-Phase: All v1.0 phases complete (1-3)
-Status: Milestone v1.0 MVP shipped
-Last activity: 2026-02-11 -- v1.0 milestone archived
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-02-11 -- Milestone v1.1 started
 
 ## Performance Metrics
 
@@ -45,5 +46,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-11
-Stopped at: v1.0 MVP milestone completed and archived
+Stopped at: Starting v1.1 milestone -- defining requirements
 Resume file: None

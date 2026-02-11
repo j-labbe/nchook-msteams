@@ -27,7 +27,22 @@ Reliably capture every Teams message notification and deliver it as structured J
 
 ### Active
 
-(None — next milestone will define new requirements)
+- [ ] Detect Teams user status via three-signal fallback chain (AX → idle time → process check)
+- [ ] Only forward notifications when status is Away or Busy; drop when Available, Offline, or Out of Office
+- [ ] Read Teams AX status text via AppleScript walking Accessibility tree of Teams window
+- [ ] Read system idle time via ioreg HIDIdleTime with 300s Away threshold
+- [ ] Detect Teams running/not-running via process check
+- [ ] Include detected_status, status_source, and status_confidence in webhook JSON payload
+- [ ] Fallback gracefully when Accessibility permission is not granted
+
+## Current Milestone: v1.1 Teams Status Integration
+
+**Goal:** Only forward Teams notifications when the user's status is Away or Busy — filter out notifications the user would see directly in Teams.
+
+**Target features:**
+- Three-signal status detection fallback chain (AX text, system idle, process check)
+- Status-aware notification gating (forward on Away/Busy, drop on Available/Offline/OOO)
+- Status metadata in webhook payloads
 
 ### Out of Scope
 
@@ -77,4 +92,4 @@ Known limitations:
 | stdlib only (no pip) | Zero dependency management for single-file daemon | ✓ Good — just `python3 nchook.py` |
 
 ---
-*Last updated: 2026-02-11 after v1.0 milestone*
+*Last updated: 2026-02-11 after v1.1 milestone start*
