@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-02-11)
 
 **Core value:** Reliably capture every Teams message notification and deliver it as structured JSON to a webhook -- no missed messages, no noise.
-**Current focus:** Phase 2 complete. Ready for Phase 3: CLI Wrapper & Operations
+**Current focus:** Phase 3 complete. All phases delivered.
 
 ## Current Position
 
-Phase: 2 of 3 (Teams Filtering & Webhook Delivery) -- COMPLETE
-Plan: 2 of 2 in current phase
-Status: Phase Complete
-Last activity: 2026-02-11 -- Completed 02-02-PLAN.md
+Phase: 3 of 3 (Operational Hardening) -- COMPLETE
+Plan: 1 of 1 in current phase
+Status: Project Complete
+Last activity: 2026-02-11 -- Completed 03-01-PLAN.md
 
-Progress: [########..] 80%
+Progress: [##########] 100%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
-- Average duration: 5.5min
-- Total execution time: 0.37 hours
+- Total plans completed: 5
+- Average duration: 5.0min
+- Total execution time: 0.42 hours
 
 **By Phase:**
 
@@ -29,9 +29,10 @@ Progress: [########..] 80%
 |-------|-------|-------|----------|
 | 01-db-watcher-state-engine | 2/2 | 15min | 7.5min |
 | 02-teams-filtering-webhook-delivery | 2/2 | 5min | 2.5min |
+| 03-operational-hardening | 1/1 | 3min | 3.0min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (3min), 01-02 (12min), 02-01 (2min), 02-02 (3min)
+- Last 5 plans: 01-02 (12min), 02-01 (2min), 02-02 (3min), 03-01 (3min)
 - Trend: Fast
 
 *Updated after each plan completion*
@@ -60,6 +61,10 @@ Recent decisions affecting current work:
 - [02-02]: post_webhook uses logging.warning (not error) for transient webhook failures
 - [02-02]: Webhook delivery gated on config not None AND webhook_url present for backward compatibility
 - [02-02]: Poll interval sourced from config at top of run_watcher for both kqueue timeout and fallback sleep
+- [03-01]: Signal handler only sets flag -- no sys.exit, no I/O beyond one log call
+- [03-01]: Post-loop save_state as belt-and-suspenders alongside in-loop save
+- [03-01]: argparse placed before config loading so --help works without config.json
+- [03-01]: dry_run only suppresses post_webhook -- state persistence unchanged
 
 ### Pending Todos
 
@@ -72,5 +77,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-11
-Stopped at: Completed 02-02-PLAN.md (webhook delivery and pipeline integration -- Phase 2 complete)
+Stopped at: Completed 03-01-PLAN.md (graceful shutdown and dry-run mode -- Phase 3 complete, all phases done)
 Resume file: None
