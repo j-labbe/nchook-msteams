@@ -42,8 +42,15 @@ COCOA_TO_UNIX_OFFSET = 978307200  # seconds between Unix epoch (1970) and Cocoa 
 STATE_FILE = "state.json"
 POLL_FALLBACK_SECONDS = 5.0  # fallback poll interval when kqueue misses events
 
-# Module-level flag for event loop control (signal handlers in Phase 3 will set False)
+# Module-level flag for event loop control (signal handler sets False for graceful shutdown)
 running = True
+
+
+def _shutdown_handler(signum, frame):
+    """Signal handler for SIGINT/SIGTERM: set running=False for graceful loop exit."""
+    global running
+    logging.info("Received %s, initiating shutdown...", signal.Signals(signum).name)
+    running = False
 
 # ---------------------------------------------------------------------------
 # DB Path Detection
@@ -765,6 +772,11 @@ def run_watcher(db_path, wal_path, state_path, config=None):
                 kq = None
                 fd = None
                 kev = None
+
+        # Graceful shutdown: flush final state
+        logging.info("Saving state before exit: last_rec_id=%d", last_rec_id)
+        save_state(last_rec_id, state_path)
+        logging.info("Shutdown complete.")
     finally:
         # Clean up resources
         if fd is not None:
@@ -804,6 +816,9 @@ def main():
     # Validate environment (FDA, schema) -- returns a connection we don't need
     validation_conn = validate_environment(db_path)
     validation_conn.close()
+
+    signal.signal(signal.SIGINT, _shutdown_handler)
+    signal.signal(signal.SIGTERM, _shutdown_handler)
 
     try:
         run_watcher(db_path, wal_path, STATE_FILE, config)
