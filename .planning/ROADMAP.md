@@ -3,7 +3,7 @@
 ## Milestones
 
 - ✅ **v1.0 MVP** — Phases 1-3 (shipped 2026-02-11)
-- 🚧 **v1.1 Teams Status Integration** — Phases 4-6 (in progress)
+- ✅ **v1.1 Teams Status Integration** — Phases 4-6 (shipped 2026-02-11)
 
 ## Phases
 
@@ -16,13 +16,13 @@
 
 </details>
 
-### 🚧 v1.1 Teams Status Integration (In Progress)
+### ✅ v1.1 Teams Status Integration — SHIPPED 2026-02-11
 
 **Milestone Goal:** Only forward Teams notifications when the user is Away or Busy -- filter out notifications the user would see directly in Teams.
 
 - [x] **Phase 4: Status Detection Core** — ioreg idle time, pgrep process check, fallback chain orchestrator — completed 2026-02-11
 - [x] **Phase 5: Config, Gating, and Event Loop Integration** — status gate wired into existing daemon with config toggle and payload metadata — completed 2026-02-11
-- [ ] **Phase 6: AX Discovery and Permission Handling** — AppleScript status reading, AX normalization, permission probing, graceful degradation
+- [x] **Phase 6: AX Discovery and Permission Handling** — AppleScript status reading, AX normalization, permission probing, graceful degradation — completed 2026-02-11
 
 ## Phase Details
 
@@ -68,7 +68,7 @@ Plans:
 **Plans**: 1 plan
 
 Plans:
-- [ ] 06-01-PLAN.md -- AX permission probe, AppleScript status query, startup instructions, and self-disable safety net
+- [x] 06-01-PLAN.md -- AX permission probe, AppleScript status query, startup instructions, and self-disable safety net
 
 ## Progress
 
@@ -81,4 +81,4 @@ Plans:
 | 3. Operational Hardening | v1.0 | 1/1 | Complete | 2026-02-11 |
 | 4. Status Detection Core | v1.1 | 1/1 | Complete | 2026-02-11 |
 | 5. Config, Gating, and Event Loop Integration | v1.1 | 1/1 | Complete | 2026-02-11 |
-| 6. AX Discovery and Permission Handling | v1.1 | 0/1 | Not started | - |
+| 6. AX Discovery and Permission Handling | v1.1 | 1/1 | Complete | 2026-02-11 |
