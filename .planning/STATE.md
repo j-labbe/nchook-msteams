@@ -10,28 +10,28 @@ See: .planning/PROJECT.md (updated 2026-02-11)
 ## Current Position
 
 Phase: 1 of 3 (DB Watcher & State Engine)
-Plan: 0 of TBD in current phase
-Status: Ready to plan
-Last activity: 2026-02-11 -- Roadmap created
+Plan: 1 of 2 in current phase
+Status: Executing
+Last activity: 2026-02-11 -- Completed 01-01-PLAN.md
 
-Progress: [..........] 0%
+Progress: [##........] 25%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 0
-- Average duration: -
-- Total execution time: 0 hours
+- Total plans completed: 1
+- Average duration: 3min
+- Total execution time: 0.05 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| - | - | - | - |
+| 01-db-watcher-state-engine | 1/2 | 3min | 3min |
 
 **Recent Trend:**
-- Last 5 plans: -
-- Trend: -
+- Last 5 plans: 01-01 (3min)
+- Trend: Starting
 
 *Updated after each plan completion*
 
@@ -45,6 +45,9 @@ Recent decisions affecting current work:
 - [Roadmap]: 3-phase structure following architectural boundary (nchook engine -> wrapper -> operations)
 - [Roadmap]: State persistence (CONF-02..04) assigned to Phase 1 since nchook owns the state engine
 - [Roadmap]: Config file loading (CONF-01) assigned to Phase 2 since wrapper consumes config for filtering/webhook
+- [01-01]: All state persistence and DB purge detection in single nchook.py module
+- [01-01]: Atomic state writes via tempfile + fsync + os.replace pattern
+- [01-01]: Plist parsing accesses nested req key for titl/subt/body, top-level for app/date
 
 ### Pending Todos
 
@@ -57,5 +60,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-11
-Stopped at: Roadmap created, ready to plan Phase 1
+Stopped at: Completed 01-01-PLAN.md (core engine: startup validation, DB access, plist parsing, state persistence)
 Resume file: None
