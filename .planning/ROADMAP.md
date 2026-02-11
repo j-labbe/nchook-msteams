@@ -21,7 +21,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 ### Phase 1: DB Watcher & State Engine
 **Goal**: The notification engine reliably detects every new notification in the macOS Sequoia database, extracts all fields (including subtitle/chat name), persists its position across restarts, and fails loudly with actionable errors when the environment is wrong.
 **Depends on**: Nothing (first phase)
-**Requirements**: DBWT-01, DBWT-02, DBWT-03, DBWT-04, DBWT-05, DBWT-06, CONF-02, CONF-03, CONF-04, OPER-01, OPER-02
+**Requirements**: DBWT-01, DBWT-02, DBWT-03, DBWT-04, DBWT-05, CONF-02, CONF-03, CONF-04, OPER-01, OPER-02
 **Success Criteria** (what must be TRUE):
   1. Running the daemon prints a startup summary showing DB path, FDA status, watched bundle IDs, and last processed rec_id
   2. When a new notification arrives in the DB, the daemon detects it within seconds and prints/logs the extracted fields (app, title, subtitle, body, timestamp)
@@ -31,19 +31,20 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans**: 2 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Core engine: startup validation, DB access, plist parsing, state persistence
-- [ ] 01-02-PLAN.md — Event loop: kqueue watcher, main entry point, live verification
+- [ ] 01-01-PLAN.md -- Core engine: startup validation, DB access, plist parsing, state persistence
+- [ ] 01-02-PLAN.md -- Event loop: kqueue watcher, main entry point, live verification
 
 ### Phase 2: Teams Filtering & Webhook Delivery
 **Goal**: The complete data pipeline works end-to-end: raw notifications are filtered to Teams messages only, structured as JSON with all required fields, and delivered to the configured webhook URL.
 **Depends on**: Phase 1
-**Requirements**: FILT-01, FILT-02, FILT-03, FILT-04, FILT-05, WEBH-01, WEBH-02, WEBH-03, WEBH-04, CONF-01
+**Requirements**: DBWT-06, FILT-01, FILT-02, FILT-03, FILT-04, FILT-05, WEBH-01, WEBH-02, WEBH-03, WEBH-04, CONF-01
 **Success Criteria** (what must be TRUE):
   1. Only Teams notifications (matching configured bundle IDs) are forwarded; all other app notifications are silently dropped
   2. Noise notifications from Teams (reactions, calls, join/leave, system alerts from "Microsoft Teams") are filtered out; only real messages with a sender and body are forwarded
   3. Each delivered webhook POST contains a JSON payload with sender name, chat/channel name, message body, timestamp, source metadata, and a truncation flag
   4. The daemon reads webhook URL, bundle IDs, poll interval, and log level from a JSON config file in the project directory
   5. When the webhook endpoint is unreachable or returns an error, the daemon logs the failure and continues processing the next notification (no hang, no crash)
+  6. Subtitle (subt) field from Phase 1 extraction is included in the callback/webhook dispatch payload
 **Plans**: TBD
 
 Plans:

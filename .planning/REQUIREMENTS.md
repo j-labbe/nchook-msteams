@@ -1,7 +1,7 @@
 # Requirements: Teams Notification Interceptor
 
 **Defined:** 2026-02-11
-**Core Value:** Reliably capture every Teams message notification and deliver it as structured JSON to a webhook — no missed messages, no noise.
+**Core Value:** Reliably capture every Teams message notification and deliver it as structured JSON to a webhook -- no missed messages, no noise.
 
 ## v1 Requirements
 
@@ -14,7 +14,7 @@ Requirements for initial release. Each maps to roadmap phases.
 - [ ] **DBWT-03**: Daemon falls back to periodic polling when kqueue events are missed (WAL checkpoint edge cases)
 - [ ] **DBWT-04**: Daemon opens notification DB in read-only mode (sqlite3 URI mode=ro) to avoid interfering with usernoted
 - [ ] **DBWT-05**: Daemon decodes binary plist blobs from the data column to extract notification fields (titl, subt, body, date)
-- [ ] **DBWT-06**: Patched nchook passes subtitle (subt) as 5th argument to the callback script
+- [ ] **DBWT-06**: Wrapper passes subtitle (subt) as a field in the callback/webhook dispatch
 
 ### Teams Filtering
 
@@ -35,14 +35,14 @@ Requirements for initial release. Each maps to roadmap phases.
 
 - [ ] **CONF-01**: Daemon reads JSON config file from project directory for webhook URL, bundle IDs, poll interval, log level
 - [ ] **CONF-02**: Daemon persists last processed rec_id to a state file using atomic writes (write-then-rename)
-- [ ] **CONF-03**: State file survives daemon restarts — new session resumes from last rec_id
+- [ ] **CONF-03**: State file survives daemon restarts -- new session resumes from last rec_id
 - [ ] **CONF-04**: Daemon detects DB purge/recreation (max rec_id < persisted rec_id) and resets state with a warning
 
 ### Startup & Operations
 
 - [ ] **OPER-01**: On startup, daemon validates Full Disk Access by attempting to read the notification DB and prints actionable error if denied
 - [ ] **OPER-02**: On startup, daemon prints summary: DB path, FDA status, bundle IDs, webhook URL, last rec_id
-- [ ] **OPER-03**: Daemon handles SIGINT/SIGTERM gracefully — flushes state to disk and exits cleanly
+- [ ] **OPER-03**: Daemon handles SIGINT/SIGTERM gracefully -- flushes state to disk and exits cleanly
 - [ ] **OPER-04**: Daemon supports --dry-run flag that logs what would be POSTed without actually sending
 
 ## v2 Requirements
@@ -88,7 +88,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DBWT-03 | Phase 1 | Pending |
 | DBWT-04 | Phase 1 | Pending |
 | DBWT-05 | Phase 1 | Pending |
-| DBWT-06 | Phase 1 | Pending |
+| DBWT-06 | Phase 2 | Pending |
 | FILT-01 | Phase 2 | Pending |
 | FILT-02 | Phase 2 | Pending |
 | FILT-03 | Phase 2 | Pending |
@@ -114,4 +114,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-02-11*
-*Last updated: 2026-02-11 after roadmap creation*
+*Last updated: 2026-02-11 -- DBWT-06 moved from Phase 1 to Phase 2 (callback dispatch is wrapper scope; Phase 1 extracts subtitle but logs only)*
