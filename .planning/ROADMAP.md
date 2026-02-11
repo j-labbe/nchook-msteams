@@ -28,11 +28,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Killing and restarting the daemon resumes from the last processed notification without replaying old ones
   4. Running the daemon without Full Disk Access prints a clear error message explaining how to grant FDA in System Settings
   5. If the notification DB has been purged (max rec_id < persisted rec_id), the daemon resets state with a warning instead of silently missing all future notifications
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 01-01: TBD
-- [ ] 01-02: TBD
+- [ ] 01-01-PLAN.md — Core engine: startup validation, DB access, plist parsing, state persistence
+- [ ] 01-02-PLAN.md — Event loop: kqueue watcher, main entry point, live verification
 
 ### Phase 2: Teams Filtering & Webhook Delivery
 **Goal**: The complete data pipeline works end-to-end: raw notifications are filtered to Teams messages only, structured as JSON with all required fields, and delivered to the configured webhook URL.
@@ -69,6 +69,6 @@ Phases execute in numeric order: 1 -> 2 -> 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. DB Watcher & State Engine | 0/TBD | Not started | - |
+| 1. DB Watcher & State Engine | 0/2 | Planned | - |
 | 2. Teams Filtering & Webhook Delivery | 0/TBD | Not started | - |
 | 3. Operational Hardening | 0/TBD | Not started | - |
