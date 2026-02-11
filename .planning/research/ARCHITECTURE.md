@@ -1,551 +1,744 @@
-# Architecture Research
+# Architecture: Status-Aware Notification Gating (v1.1)
 
-**Domain:** macOS notification database interception daemon
+**Domain:** Integrating user status detection into existing macOS notification daemon
 **Researched:** 2026-02-11
-**Confidence:** MEDIUM (nchook internals and DB schema based on training data; could not verify against live sources due to tool restrictions)
+**Confidence:** MEDIUM (AppleScript AX approach has significant uncertainty; ioreg and pgrep are well-understood)
 
-## Standard Architecture
+## Existing Architecture (v1.0 Baseline)
 
-### System Overview
+### Current Pipeline
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  macOS Notification Center (usernoted)                              │
-│  Writes notification records to SQLite DB + WAL                     │
-└──────────────┬──────────────────────────────────────────────────────┘
-               │ (filesystem write to WAL file)
-               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  COMPONENT 1: Patched nchook (Python daemon)                        │
-│                                                                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
-│  │ kqueue       │  │ DB Reader    │  │ Plist Decoder            │  │
-│  │ WAL Watcher  │→ │ (SQLite3)    │→ │ (binary plist blobs)     │  │
-│  └──────────────┘  └──────────────┘  └──────────┬───────────────┘  │
-│                                                  │                  │
-│  ┌──────────────┐  ┌──────────────────────────┐  │                  │
-│  │ State Tracker │  │ Callback Dispatcher      │←─┘                 │
-│  │ (rec_ids)     │→ │ (subprocess call)        │                    │
-│  └──────────────┘  └──────────┬───────────────┘                    │
-└──────────────────────────────┼──────────────────────────────────────┘
-                               │ subprocess.call(script, APP, TITLE,
-                               │   BODY, TIME, SUBT)
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  COMPONENT 2: Wrapper Script (shell or Python)                      │
-│                                                                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
-│  │ Teams Filter  │→ │ JSON Builder │→ │ Webhook Poster           │  │
-│  │ (allowlist)   │  │              │  │ (HTTP POST)              │  │
-│  └──────────────┘  └──────────────┘  └──────────┬───────────────┘  │
-└──────────────────────────────────────────────────┼──────────────────┘
-                                                   │ HTTP POST JSON
-                                                   ▼
-                                        ┌──────────────────────┐
-                                        │  Webhook Endpoint    │
-                                        │  (downstream agent)  │
-                                        └──────────────────────┘
+main()
+  |
+  +-- argparse (--dry-run)
+  +-- load_config()                    # config.json -> dict
+  +-- detect_db_path()                 # -> (db_path, wal_path)
+  +-- validate_environment(db_path)    # FDA check, schema verify
+  +-- signal handlers (SIGINT/SIGTERM)
+  +-- run_watcher(db_path, wal_path, state_path, config, dry_run)
+        |
+        +-- load_state()               # state.json -> last_rec_id
+        +-- check_db_consistency()     # purge detection
+        +-- print_startup_summary()
+        +-- create_wal_watcher()       # kqueue setup
+        |
+        +-- EVENT LOOP:
+              |
+              +-- kqueue.control() or time.sleep(poll_interval)
+              +-- query_new_notifications(conn, last_rec_id)
+              |     |
+              |     +-- parse_notification() per row   # binary plist
+              |
+              +-- FOR EACH notification:
+              |     +-- passes_filter(notif, config)   # 4-stage filter
+              |     +-- classify_notification(notif)    # DM/channel/mention
+              |     +-- build_webhook_payload(notif, msg_type)
+              |     +-- post_webhook() or DRY-RUN log
+              |
+              +-- save_state(last_rec_id)
+              +-- WAL recreation handling
 ```
 
-### Component Responsibilities
+### Current Functions (849 LOC, single file nchook.py)
 
-| Component | Responsibility | Typical Implementation |
-|-----------|----------------|------------------------|
-| **kqueue WAL Watcher** | Detect filesystem changes to the notification DB WAL file | Python `select.kqueue()` with `KQ_FILTER_VNODE` / `NOTE_WRITE` on the WAL file descriptor |
-| **DB Reader** | Open the SQLite DB in read-only mode, query for new records | Python `sqlite3` with `?mode=ro` URI, `PRAGMA journal_mode` awareness |
-| **Plist Decoder** | Extract human-readable fields from binary plist blobs stored in the `data` column | Python `plistlib.loads()` on the binary blob |
-| **State Tracker** | Remember which `rec_id` values have been processed to avoid duplicates | In-memory set of integers + file-based persistence (JSON or newline-delimited) |
-| **Callback Dispatcher** | Invoke the user-provided script with extracted notification fields as arguments | `subprocess.call([script, app, title, body, time, subt])` |
-| **Teams Filter** | Accept only Teams bundle IDs, require sender+body present, reject noise | String matching on APP arg against `com.microsoft.teams2` / `com.microsoft.teams`, allowlist logic |
-| **JSON Builder** | Format extracted fields into a structured JSON payload | Construct dict with sender, chat_name, body, timestamp, is_truncated flag |
-| **Webhook Poster** | POST JSON to configured URL, log-and-skip on failure | `urllib.request` or `curl` with timeout and error handling |
+| Function | LOC | Modifiable? | Notes |
+|----------|-----|-------------|-------|
+| `detect_db_path()` | 40 | No | Unchanged for v1.1 |
+| `validate_environment()` | 50 | No | Unchanged for v1.1 |
+| `parse_notification()` | 30 | No | Unchanged for v1.1 |
+| `query_new_notifications()` | 30 | No | Unchanged for v1.1 |
+| `save_state()` / `load_state()` | 40 | No | Unchanged for v1.1 |
+| `check_db_consistency()` | 15 | No | Unchanged for v1.1 |
+| `load_config()` | 35 | **Yes** | Add status config keys |
+| `passes_filter()` | 20 | No | Content filter unchanged -- status gate is separate |
+| `classify_notification()` | 25 | No | Unchanged for v1.1 |
+| `build_webhook_payload()` | 20 | **Yes** | Add status metadata fields |
+| `post_webhook()` | 20 | No | Unchanged for v1.1 |
+| `print_startup_summary()` | 15 | **Yes** | Show status detection config |
+| `run_watcher()` | 170 | **Yes** | Add status check call in loop |
+| `main()` | 30 | Minor | Unchanged (config flows through) |
+| `_shutdown_handler()` | 5 | No | Unchanged |
 
-## macOS Notification Center Database
+**Key insight:** Only 4 existing functions need modification. The status detection system is primarily NEW functions added to the file, not surgery on existing code.
 
-### DB Location
+---
 
-**Sequoia (macOS 15+):**
+## Status Detection Architecture
+
+### Three-Signal Fallback Chain
+
 ```
-~/Library/Group Containers/group.com.apple.usernoted/db2/db
-```
-
-**Pre-Sequoia (Ventura/Sonoma, macOS 13-14):**
-```
-~/Library/Group Containers/group.com.apple.usernoted/db2/db
-```
-Note: The path has been consistent in the `db2/` location since roughly macOS Ventura. Earlier macOS versions (Big Sur and before) used a different path under `$(getconf DARWIN_USER_DIR)/com.apple.notificationcenter/db2/db` or similar. The `group.com.apple.usernoted` group container path is the current standard.
-
-**Confidence:** MEDIUM -- The Sequoia path in PROJECT.md matches known patterns. The exact path should be verified on target machine by checking if the file exists.
-
-### WAL File
-
-The SQLite database uses Write-Ahead Logging. The WAL file is at:
-```
-~/Library/Group Containers/group.com.apple.usernoted/db2/db-wal
-```
-
-This is the file monitored by kqueue. When macOS writes a new notification, the WAL file is modified first, which triggers the kqueue event.
-
-### Database Schema (Reconstructed)
-
-**Confidence:** MEDIUM -- Based on training data analysis of nchook source code and macOS notification center reverse engineering. Column names and types should be verified against the live database with `sqlite3 <path> ".schema"`.
-
-The primary table is `record`:
-
-```sql
-CREATE TABLE record (
-    rec_id    INTEGER PRIMARY KEY,
-    app_id    INTEGER,          -- foreign key to app table
-    uuid      BLOB,             -- unique notification identifier
-    data      BLOB,             -- binary plist with notification content
-    delivered_date REAL,        -- Core Data timestamp (seconds since 2001-01-01)
-    presented INTEGER DEFAULT 0,
-    style     INTEGER,
-    snooze_fire_date REAL
-);
-
-CREATE TABLE app (
-    app_id    INTEGER PRIMARY KEY,
-    identifier TEXT              -- bundle ID, e.g. "com.microsoft.teams2"
-);
-
--- Additional tables exist (categories, requests, etc.) but are not
--- relevant to notification interception.
+detect_user_status(config)
+  |
+  +-- Signal 1: AX Status Text (AppleScript)
+  |     Reads Teams UI status text via osascript
+  |     Returns: "Available", "Away", "Busy", "Do not disturb",
+  |              "Be right back", "Appear offline", or None on failure
+  |     Requires: Accessibility permission granted to terminal
+  |     Confidence: HIGH (when it works) -- direct Teams self-report
+  |
+  +-- Signal 2: System Idle Time (ioreg)
+  |     Reads HIDIdleTime from IOKit registry
+  |     Returns: idle_seconds (float)
+  |     Maps to: "Away" if idle > threshold, "Available" if <= threshold
+  |     Requires: Nothing (no special permissions)
+  |     Confidence: MEDIUM -- proxy for user presence, not Teams-specific
+  |
+  +-- Signal 3: Process Check (pgrep)
+        Checks if Teams process is running
+        Returns: True/False
+        Maps to: "Offline" if not running, falls through if running
+        Requires: Nothing (no special permissions)
+        Confidence: HIGH -- definitive for Offline detection only
 ```
 
-**Key columns for this project:**
-
-| Column | Table | Type | Purpose |
-|--------|-------|------|---------|
-| `rec_id` | record | INTEGER | Monotonically increasing primary key -- used as high-water mark for "new" detection |
-| `app_id` | record | INTEGER | FK to `app.app_id` -- join to get bundle ID |
-| `data` | record | BLOB | Binary plist containing the notification payload |
-| `delivered_date` | record | REAL | Cocoa/Core Data epoch timestamp |
-| `identifier` | app | TEXT | Bundle identifier string like `com.microsoft.teams2` |
-
-### Binary Plist Payload Structure
-
-The `data` BLOB is a binary plist (property list). When decoded, it produces a dictionary with keys including:
+### Fallback Chain Logic
 
 ```python
+def detect_user_status(config):
+    """
+    Three-signal fallback chain for user status detection.
+
+    Returns dict: {
+        "status": str,          # "Available", "Away", "Busy", "Offline", "Unknown"
+        "source": str,          # "ax", "idle", "process", "error"
+        "confidence": str,      # "high", "medium", "low"
+        "raw_value": str|None,  # raw value from detection source
+    }
+    """
+    # Signal 1: AppleScript AX (highest fidelity)
+    if config.get("status_ax_enabled", True):
+        ax_result = _detect_status_ax()
+        if ax_result is not None:
+            return {
+                "status": _normalize_ax_status(ax_result),
+                "source": "ax",
+                "confidence": "high",
+                "raw_value": ax_result,
+            }
+
+    # Signal 2: System idle time (medium fidelity)
+    idle_seconds = _detect_idle_time()
+    if idle_seconds is not None:
+        threshold = config.get("idle_threshold_seconds", 300)
+        status = "Away" if idle_seconds > threshold else "Available"
+        return {
+            "status": status,
+            "source": "idle",
+            "confidence": "medium",
+            "raw_value": str(int(idle_seconds)),
+        }
+
+    # Signal 3: Process check (low fidelity, only detects Offline)
+    teams_running = _detect_teams_process(config.get("bundle_ids", set()))
+    if not teams_running:
+        return {
+            "status": "Offline",
+            "source": "process",
+            "confidence": "high",
+            "raw_value": "not_running",
+        }
+
+    # All signals failed or inconclusive
+    return {
+        "status": "Unknown",
+        "source": "error",
+        "confidence": "low",
+        "raw_value": None,
+    }
+```
+
+---
+
+## Integration Point: Where Status Gate Goes in the Pipeline
+
+### Decision: Status gate goes BEFORE the per-notification filter loop, not per-notification
+
+**Rationale:**
+1. Status is a property of the USER, not the notification. It does not change between notifications in the same batch.
+2. The status check involves subprocess calls (osascript, ioreg, pgrep). Running these once per event loop iteration (every 5s) is acceptable. Running per-notification in a burst of 20 would be wasteful.
+3. The filter pipeline (`passes_filter`) is content-based. Status gating is context-based. They are orthogonal concerns and should be separate stages.
+
+### Modified Event Loop
+
+```
+EVENT LOOP (run_watcher):
+  |
+  +-- kqueue.control() or time.sleep(poll_interval)
+  |
+  +-- [NEW] detect_user_status(config)          # Once per loop iteration
+  +-- [NEW] should_forward = passes_status_gate(status_result, config)
+  |
+  +-- IF should_forward:
+  |     +-- query_new_notifications(conn, last_rec_id)
+  |     +-- FOR EACH notification:
+  |     |     +-- passes_filter(notif, config)
+  |     |     +-- classify_notification(notif)
+  |     |     +-- build_webhook_payload(notif, msg_type, status_result)  # [MODIFIED]
+  |     |     +-- post_webhook() or DRY-RUN log
+  |     +-- save_state(last_rec_id)
+  |
+  +-- ELSE (status gate blocks):
+  |     +-- query_new_notifications(conn, last_rec_id)  # Still query!
+  |     +-- logging.debug("Status gate: dropping %d notifications (status=%s)",
+  |     |                  len(notifications), status_result["status"])
+  |     +-- IF notifications:
+  |     |     +-- last_rec_id = notifications[-1]["rec_id"]
+  |     |     +-- save_state(last_rec_id)               # Still advance!
+  |
+  +-- WAL recreation handling (unchanged)
+```
+
+### Critical Design Decision: Always Query, Always Advance State
+
+Even when the status gate blocks forwarding, the daemon MUST:
+1. **Query new notifications** -- to get the latest rec_id
+2. **Advance the high-water mark** -- so blocked notifications are not replayed when status changes
+
+Without this, transitioning from "Available" (blocked) to "Away" (forwarded) would replay all notifications that accumulated during the Available period. That would flood the webhook with stale messages the user already saw.
+
+---
+
+## New Functions (to add)
+
+### Status Detection Functions
+
+| Function | Purpose | Subprocess? | Expected Duration |
+|----------|---------|-------------|-------------------|
+| `detect_user_status(config)` | Orchestrates fallback chain | No (calls below) | Sum of sub-calls |
+| `_detect_status_ax()` | Run AppleScript to read Teams AX status | Yes: `subprocess.run(["osascript", "-e", ...])` | 200-500ms typical, up to 2s on cold start |
+| `_normalize_ax_status(raw)` | Map raw AX text to canonical status | No | Instant |
+| `_detect_idle_time()` | Run `ioreg` to get HIDIdleTime | Yes: `subprocess.run(["ioreg", ...])` | 50-150ms typical |
+| `_detect_teams_process(bundle_ids)` | Run `pgrep` to check Teams running | Yes: `subprocess.run(["pgrep", ...])` | 10-50ms typical |
+| `passes_status_gate(status_result, config)` | Decide forward/drop based on status | No | Instant |
+
+### Modified Functions
+
+| Function | Change | Scope |
+|----------|--------|-------|
+| `load_config()` | Add status config keys to defaults + validation | ~10 LOC added |
+| `build_webhook_payload()` | Add `_detected_status`, `_status_source`, `_status_confidence` | ~5 LOC added |
+| `print_startup_summary()` | Log status detection config | ~5 LOC added |
+| `run_watcher()` | Add status check + gate logic before filter loop | ~20 LOC added |
+
+**Estimated total new code:** ~200-250 LOC (bringing total to ~1050-1100 LOC). Stays manageable for single-file architecture.
+
+---
+
+## Detailed Function Specifications
+
+### _detect_status_ax()
+
+```python
+# AppleScript to walk the Teams AX tree and find the status text.
+# The new Teams (com.microsoft.teams2) has limited AX tree exposure.
+# This script uses System Events UI scripting, which requires
+# Accessibility permission for the terminal app.
+#
+# CRITICAL CAVEAT: The new Teams on macOS does NOT reliably expose
+# its AX tree to programmatic access. VoiceOver and Accessibility
+# Inspector can read it, but osascript may not. This signal is
+# HIGH VALUE but LOW RELIABILITY. The fallback chain handles this.
+
+_AX_SCRIPT = '''
+tell application "System Events"
+    if not (exists process "Microsoft Teams") then
+        return "NOT_RUNNING"
+    end if
+    tell process "Microsoft Teams"
+        try
+            -- Walk the AX tree to find the status text element.
+            -- The exact path depends on Teams version and UI state.
+            -- This is the most fragile part of the system.
+            set statusText to value of static text 1 of group 1 of ...
+            return statusText
+        on error
+            return "AX_ERROR"
+        end try
+    end tell
+end tell
+'''
+
+def _detect_status_ax():
+    """
+    Attempt to read Teams status via AppleScript AX tree walking.
+
+    Returns status string on success, None on any failure.
+    Timeout: 3 seconds (prevents daemon hang if osascript blocks).
+    """
+    try:
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", _AX_SCRIPT],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode != 0:
+            logging.debug("AX status check failed: %s", result.stderr.strip())
+            return None
+        raw = result.stdout.strip()
+        if raw in ("NOT_RUNNING", "AX_ERROR", ""):
+            return None
+        return raw
+    except subprocess.TimeoutExpired:
+        logging.debug("AX status check timed out (3s)")
+        return None
+    except (FileNotFoundError, OSError):
+        logging.debug("osascript not available")
+        return None
+```
+
+**Confidence: LOW** -- The exact AppleScript to extract Teams status text from the AX tree needs to be discovered empirically using Accessibility Inspector on the target machine. The new Teams may not expose the status text to osascript at all. The function structure and error handling are solid; the AX_SCRIPT content is a placeholder that MUST be validated during implementation.
+
+### _normalize_ax_status(raw)
+
+```python
+# Map Teams AX status strings to canonical values.
+# Teams displays localized status text. This mapping handles English.
+_AX_STATUS_MAP = {
+    "available": "Available",
+    "busy": "Busy",
+    "do not disturb": "Busy",       # Treat DND as Busy
+    "in a meeting": "Busy",         # Treat In a Meeting as Busy
+    "in a call": "Busy",            # Treat In a Call as Busy
+    "away": "Away",
+    "be right back": "Away",        # Treat BRB as Away
+    "appear offline": "Offline",
+    "offline": "Offline",
+    "out of office": "Offline",     # Treat OOO as Offline
+}
+
+def _normalize_ax_status(raw):
+    """Normalize raw AX status text to canonical status."""
+    return _AX_STATUS_MAP.get(raw.lower().strip(), "Unknown")
+```
+
+**Confidence: MEDIUM** -- The status strings are well-known Teams terminology. The exact text Teams exposes via AX may differ from UI labels. Needs validation.
+
+### _detect_idle_time()
+
+```python
+def _detect_idle_time():
+    """
+    Read system idle time via ioreg HIDIdleTime.
+
+    Returns idle time in seconds (float), or None on failure.
+    HIDIdleTime is reported in nanoseconds by IOKit.
+    """
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/ioreg", "-c", "IOHIDSystem", "-d", "4"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            if "HIDIdleTime" in line:
+                # Line format: "    |   "HIDIdleTime" = 1234567890"
+                parts = line.split("=")
+                if len(parts) == 2:
+                    try:
+                        idle_ns = int(parts[1].strip())
+                        return idle_ns / 1_000_000_000
+                    except ValueError:
+                        pass
+        return None
+    except subprocess.TimeoutExpired:
+        logging.debug("ioreg idle time check timed out")
+        return None
+    except (FileNotFoundError, OSError):
+        logging.debug("ioreg not available")
+        return None
+```
+
+**Confidence: HIGH** -- `ioreg -c IOHIDSystem` and HIDIdleTime are well-documented and stable across macOS versions. The nanosecond-to-seconds conversion is straightforward. There is one known edge case: on headless Macs without keyboard/mouse, HIDIdleTime may not reset correctly, but this daemon targets an interactive desktop.
+
+### _detect_teams_process(bundle_ids)
+
+```python
+def _detect_teams_process(bundle_ids):
+    """
+    Check if any Teams process is running via pgrep.
+
+    Returns True if running, False if not running.
+    Checks for process names matching known Teams identifiers.
+    """
+    # Teams process names to check. The new Teams (com.microsoft.teams2)
+    # runs as "Microsoft Teams" in the process table. The classic version
+    # runs as "Teams" or "Microsoft Teams".
+    process_names = ["Microsoft Teams", "Teams"]
+    for name in process_names:
+        try:
+            result = subprocess.run(
+                ["/usr/bin/pgrep", "-x", name],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:  # pgrep returns 0 if match found
+                return True
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+    return False
+```
+
+**Confidence: MEDIUM** -- The process name "Microsoft Teams" for the new Teams is reported in multiple sources. The exact process name should be verified on the target machine using `ps aux | grep -i teams`. The `pgrep -x` flag does exact match, which may miss helper processes but correctly identifies the main app.
+
+### passes_status_gate(status_result, config)
+
+```python
+def passes_status_gate(status_result, config):
+    """
+    Decide whether to forward notifications based on detected status.
+
+    Forward when: Away, Busy (user is not actively at computer or in Teams)
+    Drop when: Available (user sees notifications directly in Teams)
+    Drop when: Offline, Out of Office (user is not working)
+    Forward when: Unknown (fail-open: better to forward than to silently drop)
+
+    Returns True if notifications should be forwarded, False to drop.
+    """
+    forward_statuses = config.get("forward_statuses", {"Away", "Busy", "Unknown"})
+    return status_result["status"] in forward_statuses
+```
+
+**Confidence: HIGH** -- The gating logic is a simple set membership check. The default set (Away, Busy, Unknown) is the correct fail-open behavior: forward when uncertain, only drop when positively detecting Available/Offline.
+
+---
+
+## Config Changes
+
+### New Config Keys
+
+```json
 {
-    "app": "com.microsoft.teams2",     # Bundle ID (redundant with app table)
-    "titl": "John Smith",              # Notification title -- sender name for Teams
-    "subt": "Project Alpha Chat",      # Subtitle -- chat/channel name for Teams
-    "body": "Hey, can you review...",  # Notification body -- message content
-    "date": 728571234.567,             # Cocoa timestamp
-    "req":  "some-request-id",         # Request identifier
-    # ... additional keys vary by notification type
+    "webhook_url": "https://...",
+    "bundle_ids": ["com.microsoft.teams2", "com.microsoft.teams"],
+    "poll_interval": 5.0,
+    "log_level": "INFO",
+    "webhook_timeout": 10,
+
+    "status_enabled": true,
+    "status_ax_enabled": true,
+    "idle_threshold_seconds": 300,
+    "forward_statuses": ["Away", "Busy", "Unknown"]
 }
 ```
 
-**Key plist fields for Teams notifications:**
+| Key | Type | Default | Purpose |
+|-----|------|---------|---------|
+| `status_enabled` | bool | `true` | Master switch for status detection. When false, all notifications forwarded (v1.0 behavior). |
+| `status_ax_enabled` | bool | `true` | Enable AppleScript AX detection (Signal 1). Disable if Accessibility permission cannot be granted. |
+| `idle_threshold_seconds` | int | `300` | Seconds of idle time before status inferred as "Away". Matches Teams' built-in 5-minute idle threshold. |
+| `forward_statuses` | list[str] | `["Away", "Busy", "Unknown"]` | Which detected statuses trigger forwarding. |
 
-| Plist Key | Meaning | Teams Usage |
-|-----------|---------|-------------|
-| `titl` | Title | Sender display name |
-| `subt` | Subtitle | Chat name / channel name |
-| `body` | Body | Message content (truncated to ~150 chars) |
-| `date` | Timestamp | When notification was delivered |
-| `app` | Bundle ID | `com.microsoft.teams2` or `com.microsoft.teams` |
+### DEFAULT_CONFIG Update
 
-**Confidence:** MEDIUM -- The plist keys `titl`, `subt`, `body` are well-documented in macOS notification center reverse engineering. The exact key names should be verified by decoding a real notification from the live database.
-
-## Data Flow
-
-### End-to-End Notification Flow
-
+```python
+DEFAULT_CONFIG = {
+    "bundle_ids": ["com.microsoft.teams2", "com.microsoft.teams"],
+    "poll_interval": 5.0,
+    "log_level": "INFO",
+    "webhook_timeout": 10,
+    # v1.1 status detection
+    "status_enabled": True,
+    "status_ax_enabled": True,
+    "idle_threshold_seconds": 300,
+    "forward_statuses": ["Away", "Busy", "Unknown"],
+}
 ```
-1. User receives Teams message
-       │
-       ▼
-2. Teams app posts notification via NSUserNotificationCenter / UNUserNotificationCenter
-       │
-       ▼
-3. macOS usernoted daemon writes record to SQLite DB
-   (INSERT into record table, data = binary plist blob)
-       │
-       ▼
-4. SQLite WAL file modified on disk
-       │
-       ▼
-5. kqueue fires NOTE_WRITE event on WAL file descriptor
-       │
-       ▼
-6. nchook wakes from kqueue wait
-       │
-       ▼
-7. nchook queries: SELECT rec_id, data FROM record
-   JOIN app ON record.app_id = app.app_id
-   WHERE rec_id > last_seen_rec_id
-       │
-       ▼
-8. For each new row:
-   a. Decode binary plist from data column
-   b. Extract app, titl, subt, body, date
-   c. Update last_seen_rec_id (state tracker)
-   d. Call wrapper script with args: APP TITLE BODY TIME SUBT
-       │
-       ▼
-9. Wrapper script receives arguments
-       │
-       ▼
-10. Filter check:
-    - Is APP a Teams bundle ID? (com.microsoft.teams2 or com.microsoft.teams)
-    - Is TITLE present and not "Microsoft Teams"? (reject system alerts)
-    - Is BODY present and non-empty? (reject empty notifications)
-    - Reject known noise patterns (reactions, calls, etc.)
-       │
-       ▼
-11. Build JSON payload:
-    {
-      "sender": TITLE,
-      "chat_name": SUBT,
-      "body": BODY,
-      "timestamp": TIME (ISO 8601),
-      "is_truncated": len(BODY) >= 148,
-      "source": "macos-notification"
+
+---
+
+## Webhook Payload Changes
+
+### New Fields
+
+```python
+def build_webhook_payload(notif, msg_type, status_result=None):
+    """Build webhook payload with optional status metadata."""
+    payload = {
+        "senderName": notif.get("title", ""),
+        "chatId": notif.get("subtitle", ""),
+        "content": notif.get("body", ""),
+        "timestamp": ts_formatted,
+        "type": msg_type,
+        "subtitle": notif.get("subtitle", ""),
+        "_source": "macos-notification-center",
+        "_truncated": detect_truncation(notif.get("body", "")),
     }
-       │
-       ▼
-12. HTTP POST to webhook URL from config
-       │
-       ▼
-13. Log result (success or failure), continue
+    # v1.1: Add status metadata
+    if status_result is not None:
+        payload["_detected_status"] = status_result["status"]
+        payload["_status_source"] = status_result["source"]
+        payload["_status_confidence"] = status_result["confidence"]
+    return payload
 ```
 
-### State Management Flow
+The `_detected_status`, `_status_source`, and `_status_confidence` fields use the underscore prefix convention established by v1.0's `_source` and `_truncated` fields, signaling these are metadata rather than message content.
+
+---
+
+## Data Flow: Status Through the System
 
 ```
-Startup:
-  1. Read state file (JSON with rec_ids set or last_rec_id integer)
-  2. Load into memory as set/high-water-mark
-  3. Begin kqueue monitoring
-
-Per notification:
-  1. Check rec_id against state
-  2. Process if new
-  3. Add rec_id to state
-  4. Periodically flush state to disk (or flush per-notification)
-
-Shutdown:
-  1. Write final state to disk
-  2. Close DB connection
-  3. Close kqueue fd
+config.json
+  |  "status_enabled": true
+  |  "idle_threshold_seconds": 300
+  |  "forward_statuses": ["Away", "Busy", "Unknown"]
+  |
+  v
+load_config() --> config dict (in memory)
+  |
+  v
+run_watcher(... config ...)
+  |
+  +-- Each loop iteration:
+  |     |
+  |     v
+  |   detect_user_status(config)
+  |     |
+  |     +--[try]--> _detect_status_ax()
+  |     |             subprocess.run(osascript ...)
+  |     |             --> "Away" | None (on failure)
+  |     |
+  |     +--[try]--> _detect_idle_time()
+  |     |             subprocess.run(ioreg ...)
+  |     |             --> 342.5 seconds | None
+  |     |
+  |     +--[try]--> _detect_teams_process(bundle_ids)
+  |                   subprocess.run(pgrep ...)
+  |                   --> True | False
+  |     |
+  |     v
+  |   status_result = {
+  |     "status": "Away",
+  |     "source": "idle",
+  |     "confidence": "medium",
+  |     "raw_value": "342"
+  |   }
+  |     |
+  |     v
+  |   passes_status_gate(status_result, config)
+  |     --> True (Away is in forward_statuses)
+  |     |
+  |     v
+  |   [forward path]
+  |     query_new_notifications(...)
+  |     for notif in notifications:
+  |       passes_filter(notif, config)       # existing content filter
+  |       classify_notification(notif)       # existing classification
+  |       build_webhook_payload(notif, type, status_result)  # status injected
+  |       post_webhook(payload, ...)
+  |     |
+  |     v
+  |   Webhook JSON includes:
+  |     {
+  |       "senderName": "Alice",
+  |       "content": "Hey, check this out",
+  |       "_detected_status": "Away",
+  |       "_status_source": "idle",
+  |       "_status_confidence": "medium",
+  |       ...
+  |     }
 ```
 
-## Recommended Project Structure
-
-```
-macos-notification-intercept/
-├── nchook/                    # Patched nchook (forked, modified)
-│   ├── nchook.py              # Main daemon: kqueue watcher + DB reader + plist decoder
-│   └── README.md              # Fork notes: what was changed and why
-├── handler.sh                 # Wrapper script called by nchook (or handler.py)
-├── config.json                # User configuration
-│   # {
-│   #   "webhook_url": "https://...",
-│   #   "bundle_ids": ["com.microsoft.teams2", "com.microsoft.teams"],
-│   #   "log_level": "INFO"
-│   # }
-├── state.json                 # Persisted state (auto-generated, gitignored)
-│   # { "last_rec_id": 12345 }
-├── run.sh                     # Entry point: launches nchook with handler path
-├── .gitignore                 # state.json, __pycache__, etc.
-└── .planning/                 # Project planning (GSD)
-    ├── PROJECT.md
-    └── research/
-```
-
-### Structure Rationale
-
-- **nchook/**: Isolated as a forked dependency. Changes to nchook are tracked separately. The patched file is self-contained Python with no external dependencies beyond stdlib.
-- **handler.sh (or handler.py)**: The wrapper script is the primary custom code. Keeping it at root makes it easy to reference from run.sh. Shell script is simplest for the subprocess call pattern nchook uses; Python script is an option if JSON construction or filtering logic grows complex.
-- **config.json**: User-editable configuration at project root. Read by handler script (not by nchook -- nchook only cares about DB path and handler path).
-- **state.json**: Auto-generated, gitignored. Simple JSON with last_rec_id or a set of processed rec_ids.
-- **run.sh**: Single entry point that configures and launches nchook pointing at handler.sh.
-
-## Architectural Patterns
-
-### Pattern 1: kqueue WAL File Watching
-
-**What:** Instead of polling the SQLite database on a timer, use the kernel's kqueue mechanism to get notified when the WAL file changes. This gives near-instant detection of new notifications.
-
-**When to use:** Always -- this is the standard approach for macOS notification DB watching. Polling would work but wastes CPU and introduces latency.
-
-**Trade-offs:**
-- Pro: Near-zero latency, near-zero CPU when idle
-- Pro: No polling interval to tune
-- Con: kqueue is macOS/BSD specific (not portable, but portability is not a concern here)
-- Con: WAL file changes don't guarantee new records -- checkpoints and other writes also trigger events, so the reader must handle "no new records" gracefully
-
-**Implementation sketch:**
-```python
-import select
-import os
-
-kq = select.kqueue()
-wal_fd = os.open(wal_path, os.O_RDONLY)
-event = select.kevent(
-    wal_fd,
-    filter=select.KQ_FILTER_VNODE,
-    flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_CLEAR,
-    fflags=select.KQ_NOTE_WRITE
-)
-
-while True:
-    events = kq.control([event], 1, None)  # blocks until WAL written
-    # Query DB for new records...
-```
-
-### Pattern 2: High-Water Mark State Tracking
-
-**What:** Track the highest `rec_id` processed rather than a set of all processed IDs. Since `rec_id` is a monotonically increasing integer primary key, any `rec_id > last_seen` is new.
+---
 
-**When to use:** When the primary key is guaranteed monotonically increasing (which SQLite INTEGER PRIMARY KEY is, absent explicit reuse).
+## Component Boundaries
 
-**Trade-offs:**
-- Pro: O(1) storage, O(1) comparison
-- Pro: State file is tiny (single integer)
-- Con: If macOS ever reuses or resets rec_ids (e.g., DB wipe on upgrade), could miss or re-process
-- Con: Cannot skip/exclude specific rec_ids without additional logic
+| Component | Responsibility | Communicates With |
+|-----------|---------------|-------------------|
+| **Config loader** (`load_config`) | Parse status config keys, set defaults | Provides config dict to all components |
+| **Status detector** (`detect_user_status`) | Orchestrate fallback chain, return canonical result | Calls three signal functions, returns to event loop |
+| **AX signal** (`_detect_status_ax`) | AppleScript subprocess for Teams status text | External: osascript process. Returns to detector. |
+| **Idle signal** (`_detect_idle_time`) | ioreg subprocess for HIDIdleTime | External: ioreg process. Returns to detector. |
+| **Process signal** (`_detect_teams_process`) | pgrep subprocess for Teams process check | External: pgrep process. Returns to detector. |
+| **Status gate** (`passes_status_gate`) | Forward/drop decision based on status | Reads status result + config. Returns bool to event loop. |
+| **Payload builder** (`build_webhook_payload`) | Include status metadata in webhook JSON | Receives status result from event loop. |
+| **Event loop** (`run_watcher`) | Orchestrate status check -> gate -> query -> filter -> deliver | Central coordinator. Modified, not rewritten. |
 
-**Why not a set of all rec_ids:** The notification DB can accumulate thousands of records. Storing all processed IDs wastes memory and disk. High-water mark is sufficient because the query is `WHERE rec_id > ?` which naturally excludes all previously seen records.
+---
 
-**Implementation sketch:**
-```python
-# Query for new notifications
-cursor.execute("""
-    SELECT r.rec_id, r.data, a.identifier, r.delivered_date
-    FROM record r
-    JOIN app a ON r.app_id = a.app_id
-    WHERE r.rec_id > ?
-    ORDER BY r.rec_id ASC
-""", (last_rec_id,))
+## Patterns to Follow
 
-for row in cursor.fetchall():
-    rec_id, data, bundle_id, delivered_date = row
-    # process...
-    last_rec_id = rec_id  # advance high-water mark
+### Pattern 1: Fallback Chain with Typed Results
 
-# Persist
-with open("state.json", "w") as f:
-    json.dump({"last_rec_id": last_rec_id}, f)
-```
+**What:** Each signal function returns a typed result or None. The orchestrator tries signals in order, using the first non-None result. Every result carries source and confidence metadata.
 
-### Pattern 3: Subprocess Callback Dispatch
+**Why:** Graceful degradation. If Accessibility permission is denied, AX returns None and idle time takes over. If ioreg fails (unlikely), process check provides minimal signal. The system never crashes due to a failed status check.
 
-**What:** nchook invokes the handler as a subprocess with notification fields as positional arguments. This decouples nchook (generic notification watcher) from the handler (Teams-specific logic).
+**Implementation principle:** Each signal function handles its OWN errors internally and returns None on ANY failure. The orchestrator never catches exceptions from signal functions.
 
-**When to use:** This is nchook's existing architecture. Maintaining it preserves the clean separation between "watch DB" and "do something with notification."
+### Pattern 2: Status Check Once Per Loop Iteration, Not Per Notification
 
-**Trade-offs:**
-- Pro: Handler can be any language (shell, Python, etc.)
-- Pro: Handler crash doesn't crash the watcher
-- Pro: Easy to test handler independently
-- Con: Subprocess overhead per notification (fork + exec)
-- Con: Arguments limited by command-line length (not a real concern for notification text)
-- Con: Special characters in notification text need proper escaping
+**What:** Call `detect_user_status()` once at the top of each event loop iteration. Pass the result into the per-notification processing.
 
-**Argument convention (patched nchook):**
-```
-handler.sh APP TITLE BODY TIME SUBT
-   $1  = "com.microsoft.teams2"
-   $2  = "John Smith"              (sender name / titl)
-   $3  = "Hey, can you review..."  (message body)
-   $4  = "2026-02-11T14:30:00"     (timestamp)
-   $5  = "Project Alpha Chat"      (chat/channel name / subt)
-```
+**Why:** Status detection involves subprocess calls (osascript: 200-500ms, ioreg: 50-150ms, pgrep: 10-50ms). Running these per-notification in a burst of 20 notifications would add 5-10 seconds of overhead. Running once per loop iteration (every 5s poll interval) adds at most 500ms per cycle.
 
-### Pattern 4: Read-Only SQLite Access with WAL Awareness
+### Pattern 3: Always Advance State, Even When Gated
 
-**What:** Open the notification database in read-only mode with `immutable=0` to avoid write locks while still reading WAL contents.
+**What:** When the status gate blocks forwarding, still query notifications and advance the rec_id high-water mark.
 
-**When to use:** Always -- this is a system database owned by usernoted. Writing to it would be dangerous and unnecessary.
+**Why:** Prevents replay of stale notifications when status transitions. The user was Available, saw messages directly in Teams, status changes to Away -- the daemon should NOT replay the messages from the Available period.
 
-**Trade-offs:**
-- Pro: Cannot corrupt the system database
-- Pro: No lock contention with usernoted
-- Con: Must handle SQLITE_BUSY if usernoted is checkpointing
-- Con: Read-only connections may not see very recent WAL entries depending on timing
+### Pattern 4: Fail-Open on Unknown Status
 
-**Implementation considerations:**
-```python
-import sqlite3
+**What:** When all status signals fail, return "Unknown" status with "low" confidence. "Unknown" is in the default `forward_statuses` set, so notifications are forwarded.
 
-# Open read-only
-conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+**Why:** Silent dropping is worse than occasional duplicates. If the status detection system breaks, the daemon falls back to v1.0 behavior (forward everything). The downstream consumer receives the `_status_confidence: "low"` signal and can handle it.
 
-# Important: set WAL mode awareness
-conn.execute("PRAGMA journal_mode")  # will return "wal"
+### Pattern 5: Subprocess Timeout on Every External Call
 
-# Query... (may need retry on SQLITE_BUSY)
-```
+**What:** Every `subprocess.run()` call includes `timeout=3`. Timeout exceptions are caught and treated as signal failure (return None).
 
-## Anti-Patterns
+**Why:** Prevents the daemon from hanging if osascript blocks (e.g., Accessibility permission dialog), ioreg stalls (unlikely but possible), or pgrep deadlocks. The 3-second timeout is generous (most calls complete in <500ms) but prevents infinite hangs.
 
-### Anti-Pattern 1: Polling the Database on a Timer
+---
 
-**What people do:** Use `time.sleep(N)` in a loop and re-query the database every N seconds.
+## Anti-Patterns to Avoid
 
-**Why it's wrong:** Wastes CPU cycles during idle periods. Introduces latency (up to N seconds). Forces you to choose between responsiveness (low N = more CPU) and efficiency (high N = missed messages for longer).
+### Anti-Pattern 1: Status Check Per Notification
 
-**Do this instead:** Use kqueue on the WAL file. Zero CPU when idle, near-instant wake on new notifications.
+**What people do:** Call `detect_user_status()` inside the `for notif in notifications` loop.
 
-### Anti-Pattern 2: Storing All Processed rec_ids as a Set
+**Why bad:** A burst of 20 notifications means 20 subprocess calls to osascript (200ms each = 4 seconds added). Status does not change between notifications in a single batch.
 
-**What people do:** Maintain a set of every rec_id ever seen and persist it as a JSON array.
+**Instead:** Check once at the top of the loop iteration. Pass the result through.
 
-**Why it's wrong:** The set grows without bound as macOS accumulates notifications. After weeks/months, state file becomes unnecessarily large. Loading a large set on startup becomes slow.
+### Anti-Pattern 2: Blocking on Accessibility Permission Dialog
 
-**Do this instead:** Store only the high-water mark (single integer). Periodically, if paranoid about DB resets, also store a hash or count as a sanity check.
+**What people do:** Run osascript without a timeout. If Accessibility permission is not granted, macOS shows a dialog and osascript blocks indefinitely waiting for user response.
 
-### Anti-Pattern 3: Opening the DB in Read-Write Mode
+**Why bad:** Daemon hangs. No notifications processed until user dismisses dialog.
 
-**What people do:** Use default `sqlite3.connect(path)` which opens read-write.
+**Instead:** `subprocess.run(... timeout=3)`. If osascript blocks, the TimeoutExpired exception fires, signal returns None, fallback chain continues with idle time.
 
-**Why it's wrong:** Risk of accidental writes to a system database. Potential lock contention with usernoted. macOS integrity protection may block write access entirely on newer versions.
+### Anti-Pattern 3: Not Advancing State When Gated
 
-**Do this instead:** Always use `?mode=ro` in the URI: `sqlite3.connect(f"file:{path}?mode=ro", uri=True)`.
+**What people do:** Skip `query_new_notifications()` entirely when status gate says "don't forward."
 
-### Anti-Pattern 4: Parsing the Binary Plist Manually
+**Why bad:** rec_id never advances. When status changes to Away, all accumulated Available-period notifications replay. User gets flooded with messages they already read hours ago.
 
-**What people do:** Try to parse the binary plist format manually or use regex on the raw bytes.
+**Instead:** Always query, always advance rec_id, just skip the webhook POST.
 
-**Why it's wrong:** Binary plist is a structured format. Manual parsing is fragile and incomplete.
+### Anti-Pattern 4: Caching Status Across Multiple Loop Iterations
 
-**Do this instead:** Use Python's built-in `plistlib.loads(data)` which handles binary plist natively.
+**What people do:** Cache the status result and reuse it for N iterations to "reduce subprocess overhead."
 
-### Anti-Pattern 5: Monolithic Single Script
+**Why bad:** Status can change at any moment (user goes AFK, starts a meeting, opens Teams). A 30-second stale cache means up to 30 seconds of incorrect gating. The 5-second poll interval already provides natural rate limiting.
 
-**What people do:** Put DB watching, plist decoding, Teams filtering, JSON formatting, and webhook posting all in one script.
+**Instead:** Check every iteration. The ~500ms cost per 5-second cycle is acceptable (10% overhead, no user impact).
 
-**Why it's wrong:** Cannot test components independently. Cannot reuse the watcher for other notification types. Harder to debug which layer failed.
+### Anti-Pattern 5: Using PyObjC for AX Access
 
-**Do this instead:** Maintain the nchook/handler separation. nchook watches and dispatches; handler filters and delivers. Two focused components rather than one sprawling script.
+**What people do:** Import PyObjC to call the Accessibility API directly from Python, avoiding the osascript subprocess.
 
-## Integration Points
+**Why bad:** Violates the project constraint of stdlib-only. PyObjC is an external dependency. The performance gain (avoiding fork+exec) is not worth breaking the zero-dependency principle.
 
-### External Services
+**Instead:** Use `subprocess.run(["/usr/bin/osascript", ...])`. Accept the subprocess overhead. It is within budget.
 
-| Service | Integration Pattern | Notes |
-|---------|---------------------|-------|
-| macOS Notification Center (usernoted) | Read-only SQLite access + kqueue on WAL file | System-owned DB; read-only access essential. DB path varies by macOS version. |
-| Webhook Endpoint | HTTP POST with JSON body | Timeout should be short (5-10s). Log-and-skip on failure per project requirements. |
+---
 
-### Internal Boundaries
+## Build Order (v1.1 Phase Dependencies)
 
-| Boundary | Communication | Notes |
-|----------|---------------|-------|
-| nchook -> handler | subprocess.call with positional args | Clean process boundary. Handler receives APP, TITLE, BODY, TIME, SUBT as $1-$5. Handler exit code is informational only (nchook continues regardless). |
-| handler -> config | File read (config.json) | Handler reads config on each invocation (stateless per-call). Alternatively, handler could cache config and re-read on SIGHUP. |
-| handler -> state | File read/write (state.json) | Note: if state is managed by nchook (rec_id tracking), handler doesn't need state. If handler manages state, it must handle concurrent invocations safely (though nchook calls sequentially). |
+### Step 1: Status Detection Core (Foundation)
 
-### Critical Boundary Decision: Where Does State Live?
+Build the three signal functions and the orchestrator. Test each independently.
 
-Two viable approaches:
+**New functions:**
+- `_detect_idle_time()` -- simplest, most reliable, build and test first
+- `_detect_teams_process()` -- second simplest, build and test second
+- `_detect_status_ax()` -- most complex and fragile, build last
+- `_normalize_ax_status()` -- mapping function, trivial
+- `detect_user_status()` -- orchestrator, wires the above together
 
-**Option A: State in nchook (recommended)**
-- nchook tracks last_rec_id in memory + persists to state file
-- nchook only calls handler for truly new notifications
-- Handler is stateless -- receives args, filters, posts, exits
-- Pro: Single writer for state file, no race conditions
-- Pro: Handler is simple and testable
-- Con: Requires patching nchook's state management (adding file persistence)
+**Depends on:** Nothing (new code, no existing function modifications)
+**Why this order:** Start with ioreg (guaranteed to work, no permissions needed), then pgrep (guaranteed to work), then AX (may not work, needs empirical discovery). This lets you test the fallback chain with working signals before tackling the uncertain AX signal.
 
-**Option B: State in handler**
-- nchook calls handler for every notification on WAL change
-- Handler maintains its own rec_id tracking
-- Pro: nchook needs fewer patches
-- Con: Handler must be careful about concurrent calls (though nchook calls sequentially)
-- Con: Handler does duplicate work (called for already-seen notifications)
+### Step 2: Status Gating Logic
 
-**Recommendation:** Option A. nchook already tracks rec_ids in memory; patching it to persist to a file is minimal work and keeps the handler stateless.
+Build the gate function and wire it into the event loop.
 
-## Build Order (Suggested Phase Dependencies)
+**New functions:**
+- `passes_status_gate()` -- simple set membership check
 
-Understanding component dependencies informs what to build first:
+**Modified functions:**
+- `run_watcher()` -- add status check + gate + always-advance logic
 
-### Phase 1: Patched nchook (Foundation)
+**Depends on:** Step 1 (needs `detect_user_status()` to exist)
 
-Everything depends on nchook being able to watch the Sequoia DB and extract the subtitle field. This is the critical path.
+### Step 3: Config and Payload Integration
 
-**Tasks:**
-1. Fork nchook, update DB path detection for Sequoia
-2. Add `subt` extraction from binary plist
-3. Add `subt` as 5th argument to callback dispatch
-4. Add state file persistence for `last_rec_id`
-5. Test: run patched nchook with a dummy handler that prints args
+Add config keys, payload fields, and startup display.
 
-**Depends on:** Nothing (foundational component)
-**Blocks:** Everything else
+**Modified functions:**
+- `load_config()` -- add status defaults
+- `build_webhook_payload()` -- add status metadata
+- `print_startup_summary()` -- show status config
 
-### Phase 2: Wrapper Script (Core Logic)
+**Depends on:** Step 1 + Step 2 (needs status result dict shape to be finalized)
 
-With nchook dispatching notifications correctly, build the filtering and delivery layer.
+### Step 4: AppleScript AX Discovery (Empirical)
 
-**Tasks:**
-1. Receive args from nchook ($1-$5)
-2. Filter by Teams bundle ID
-3. Allowlist logic (require sender + body)
-4. Noise rejection (system alerts, reactions, etc.)
-5. JSON construction with truncation detection
-6. Config file reading (webhook URL)
-7. HTTP POST to webhook
-8. Error handling (log-and-skip)
+Use Accessibility Inspector to map the Teams AX tree on the target machine. Write the actual AppleScript. This step cannot be completed without interactive access to a running Teams instance.
 
-**Depends on:** Phase 1 (needs nchook to call it with correct args)
-**Blocks:** Phase 3
+**Modified functions:**
+- `_detect_status_ax()` -- replace placeholder AX_SCRIPT with real script
 
-### Phase 3: Integration and Hardening
+**Depends on:** Step 1 (placeholder exists), interactive macOS session with Teams running
+**Risk:** This step may reveal that the new Teams does NOT expose status via AX at all. If so, the AX signal is permanently disabled and the idle time + process check provide the fallback. The architecture handles this gracefully because the fallback chain already works without AX.
 
-End-to-end testing and operational polish.
+---
 
-**Tasks:**
-1. Entry point script (run.sh) wiring nchook to handler
-2. End-to-end test with real Teams notifications
-3. Logging (what was filtered, what was forwarded, failures)
-4. Config validation on startup
-5. Graceful shutdown handling (SIGTERM/SIGINT)
+## Performance Budget
 
-**Depends on:** Phase 1 + Phase 2
+| Operation | Duration | Frequency | Impact |
+|-----------|----------|-----------|--------|
+| AX status (osascript) | 200-500ms | Every 5s | Adds 4-10% to loop cycle time |
+| Idle time (ioreg) | 50-150ms | Every 5s (fallback) | Adds 1-3% to loop cycle time |
+| Process check (pgrep) | 10-50ms | Every 5s (fallback) | Adds <1% to loop cycle time |
+| **Worst case (all three)** | **260-700ms** | **Every 5s** | **5-14% overhead** |
+| **Typical case (AX succeeds)** | **200-500ms** | **Every 5s** | **4-10% overhead** |
+| **Typical case (AX fails, idle succeeds)** | **50-150ms** | **Every 5s** | **1-3% overhead** |
+
+The fallback chain is self-optimizing: the most expensive signal (AX) is tried first but also the most likely to fail (producing a fast None return). When AX fails, the cheaper signals handle detection.
+
+If AX is permanently unavailable, disabling it via `status_ax_enabled: false` in config eliminates the 200-500ms cost entirely.
+
+---
 
 ## Scaling Considerations
 
-This is a single-user local daemon. "Scaling" means reliability, not throughput.
+| Concern | Impact | Mitigation |
+|---------|--------|------------|
+| Subprocess fork overhead | 3 fork+exec per loop iteration max | Each is <500ms; pool is fixed at 3 max |
+| osascript cold start | First call ~1-2s, subsequent ~200ms | Not a problem for daemon that runs continuously |
+| HIDIdleTime accuracy | Value is system-wide, not Teams-specific | Acceptable proxy; Teams itself uses the same 5-min idle threshold |
+| Status during screen lock | ioreg still works; AX may not | ioreg reports high idle time -> correct "Away" |
+| Status during sleep | Daemon paused by OS during sleep | On wake, first loop iteration detects current status correctly |
+| Multiple Teams windows | AX may read wrong window's status | Normalize to worst case (if any window shows Available, user is Available) |
 
-| Concern | Normal Operation | Edge Cases |
-|---------|-----------------|------------|
-| Notification volume | Teams generates ~1-50 notifications/hour for active user | Meeting chat can generate bursts of 10-20 in seconds |
-| DB size | Notification DB grows over time; old records pruned by macOS | Thousands of records is normal; query should use rec_id index |
-| WAL file churn | WAL written on each notification | Checkpoint events also trigger kqueue -- must handle "no new records" case |
-| Webhook latency | Synchronous POST per notification; ~100-500ms typical | Slow webhook blocks processing of next notification; consider async or timeout |
-| State file I/O | Write state after each notification batch | Crash between processing and state write = re-processing on restart (idempotent if downstream handles dupes) |
-
-### Burst Handling
-
-When a meeting chat generates rapid notifications, nchook receives one kqueue event per WAL write (or batched events). The query `WHERE rec_id > last_seen` naturally batch-reads all new records. The subprocess calls are sequential, so a burst of 20 notifications means 20 sequential handler invocations. This is fine -- each handler call is fast (filter + POST).
-
-If webhook latency becomes a concern during bursts, the handler could batch multiple notifications into a single POST. But this adds complexity and should only be considered if real-world testing shows it's needed.
+---
 
 ## Sources
 
-- PROJECT.md in this repository (primary architecture decisions and constraints)
-- nchook by who23 on GitHub (https://github.com/who23/nchook) -- training data knowledge of the tool's architecture, kqueue-based WAL watching, subprocess dispatch pattern. **Confidence: MEDIUM** -- could not fetch live source to verify current state.
-- macOS notification center SQLite database internals -- training data knowledge of the DB schema, binary plist storage, usernoted daemon. **Confidence: MEDIUM** -- schema details reconstructed from training data; column names and plist keys should be verified against live database.
-- Python sqlite3, plistlib, select.kqueue documentation -- **Confidence: HIGH** -- stable stdlib APIs unlikely to have changed.
-- macOS kqueue documentation -- **Confidence: HIGH** -- stable kernel API.
+### AppleScript / AX Status Detection
+- [Microsoft Community Hub: enable Accessibility Tree on macOS in the new Teams](https://techcommunity.microsoft.com/discussions/teamsdeveloper/enable-accessibility-tree-on-macos-in-the-new-teams-work-or-school/4033014) -- Confirms new Teams does NOT reliably expose AX tree. **MEDIUM confidence.**
+- [Apple Developer Forums: AX Elements in some apps only exposed when VoiceOver active](https://developer.apple.com/forums/thread/756895) -- Confirms AX tree availability depends on assistive technology state. **MEDIUM confidence.**
+- [Apple Mac Automation Scripting Guide: Automating the User Interface](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/AutomatetheUserInterface.html) -- Official guide for System Events UI scripting. **HIGH confidence.**
+- [n8henrie: A Strategy for UI Scripting in AppleScript](https://n8henrie.com/2013/03/a-strategy-for-ui-scripting-in-applescript/) -- Practical guide for discovering AX element hierarchies. **HIGH confidence.**
 
-### Verification Recommendations
+### ioreg / HIDIdleTime
+- [DSSW: Inactivity and Idle Time on OS X](https://www.dssw.co.uk/blog/2015-01-21-inactivity-and-idle-time/) -- Explains HIDIdleTime in IOKit registry, nanosecond units. **HIGH confidence.**
+- [Karabiner-Elements issue #385: HIDIdleTime not reset with keyboard](https://github.com/pqrs-org/Karabiner-Elements/issues/385) -- Documents known edge case with HIDIdleTime. **HIGH confidence.**
+- [Apple Developer Forums: HIDIdleTime not being reset](https://developer.apple.com/forums/thread/721530) -- Confirms HIDIdleTime is the standard approach but has edge cases on headless systems. **MEDIUM confidence.**
 
-Before implementation, verify these against the live system:
+### Process Detection
+- [Helge Klein: Identifying MS Teams Application Instances](https://helgeklein.com/blog/identifying-ms-teams-application-instances-counting-app-starts/) -- Documents Teams process names and helper processes. **MEDIUM confidence.**
+- [mre/teams-call on GitHub](https://github.com/mre/teams-call) -- Shell/Python script detecting Teams call status via log files. Alternative approach if AX fails. **MEDIUM confidence.**
 
-1. **DB path exists:** `ls -la ~/Library/Group\ Containers/group.com.apple.usernoted/db2/db`
-2. **DB schema:** `sqlite3 ~/Library/Group\ Containers/group.com.apple.usernoted/db2/db ".schema"`
-3. **Plist keys:** Decode a real Teams notification blob and inspect key names
-4. **nchook current source:** Fetch https://github.com/who23/nchook to confirm current callback args and DB path logic
-5. **Teams bundle ID:** Check which bundle ID your Teams installation uses (`com.microsoft.teams2` for new Teams, `com.microsoft.teams` for classic)
+### subprocess / Performance
+- [Python 3 subprocess documentation](https://docs.python.org/3/library/subprocess.html) -- Official docs for subprocess.run, timeout behavior. **HIGH confidence.**
+- [Apple Community: osascript performance slower than Script Editor](https://discussions.apple.com/thread/8612365) -- Confirms osascript subprocess overhead. **MEDIUM confidence.**
 
 ---
-*Architecture research for: macOS notification database interception daemon*
+*Architecture research for: Status-aware notification gating integration (v1.1)*
 *Researched: 2026-02-11*

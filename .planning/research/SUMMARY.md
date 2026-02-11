@@ -1,309 +1,180 @@
 # Project Research Summary
 
-**Project:** macos-notification-intercept
-**Domain:** macOS system daemon for notification interception and webhook forwarding
+**Project:** Teams Notification Interceptor (v1.1 -- Status-Aware Gating)
+**Domain:** macOS daemon -- user presence detection via subprocess fallback chain
 **Researched:** 2026-02-11
-**Confidence:** MEDIUM-HIGH
+**Confidence:** MEDIUM
 
 ## Executive Summary
 
-This project builds a zero-dependency Python daemon that intercepts Microsoft Teams notifications from macOS Sequoia's notification center database and forwards them via webhook to downstream agents. The technical approach combines proven patterns from nchook (kqueue-based SQLite WAL file watching) with Teams-specific filtering and JSON payload construction. The entire stack uses Python 3.12+ standard library—no external dependencies, no virtualenv, making it deployable with zero setup on any macOS Sequoia machine.
+This milestone adds status-aware notification gating to an existing 849 LOC Python daemon that already intercepts Teams notifications from the macOS notification center database. The approach is a three-signal fallback chain: (1) AppleScript AX tree reading for direct Teams status text, (2) ioreg HIDIdleTime for system idle detection, and (3) pgrep for Teams process liveness. All three use `subprocess.run()` which is already imported and used in the codebase. No new Python dependencies are needed. The daemon will forward notifications when the user is Away or Busy, and suppress when Available -- with a fail-open policy that forwards on any detection failure.
 
-The recommended architecture maintains clean separation between generic notification watching (patched nchook) and Teams-specific logic (wrapper script). This allows independent testing and keeps complexity isolated. The core data flow is: kqueue detects WAL writes → query DB for new records → decode binary plists → filter for Teams messages → build JSON → POST to webhook. State persistence (last processed rec_id) prevents duplicate deliveries across restarts.
+The recommended approach builds on existing patterns in the codebase (subprocess calls, config loading, webhook payload building) and requires modifying only 4 existing functions while adding approximately 200-250 LOC of new detection and gating logic. The architecture inserts a status gate before the per-notification processing loop, checks status once per poll cycle (not per notification), and always advances the notification high-water mark even when gating suppresses forwarding. This prevents stale notification replay on status transitions.
 
-Critical risks center on macOS system integration fragility: SQLite database locking conflicts with the usernoted process, kqueue file descriptor staleness during WAL checkpoints, Full Disk Access permission failures, and notification database schema changes between macOS versions. All of these have proven mitigation strategies (read-only DB access, fallback poll timer, startup validation, explicit FDA checks) that must be implemented from Phase 1. The Teams notification format variations and truncation behavior are manageable through defensive parsing and transparent metadata flags in the webhook payload.
+The primary risk is the AppleScript AX signal. The new Teams client (com.microsoft.teams2) has a known broken Accessibility tree -- community reports confirm the old Electron AX walking methods no longer work. This signal may be permanently unavailable. The architecture is designed for this: idle time + process check alone deliver approximately 80% of the value (forward when idle for 5+ minutes, suppress when active). AX reading is a high-value enhancement that must be validated empirically with Accessibility Inspector before investing implementation time.
 
 ## Key Findings
 
 ### Recommended Stack
 
-**Core: Python 3.12+ stdlib only.** The entire stack leverages macOS Sequoia's bundled Python 3.12 with zero external dependencies. This includes `sqlite3` for database access, `select.kqueue` for file system event monitoring, `plistlib` for decoding binary notification payloads, `urllib.request` for webhook delivery, and `json`/`logging` for configuration and observability. No `requirements.txt`, no virtualenv, no dependency management. This is the correct pattern because the problem domain maps perfectly to stdlib capabilities.
+No new Python imports are needed. The existing `subprocess`, `re`, `logging`, and `time` imports cover all requirements. Three macOS system binaries provide the detection signals: `/usr/bin/pgrep` (process check, <50ms), `/usr/sbin/ioreg` (idle time, <200ms), and `/usr/bin/osascript` (AX status, 200ms-3s). All are SIP-protected system utilities present on every macOS installation.
 
 **Core technologies:**
-- **Python 3.12+ (system)**: Runtime — macOS Sequoia ships Python 3.12 via Xcode CLT; zero external dependencies needed
-- **sqlite3 (stdlib)**: Read-only notification DB access — handles WAL mode reads, timeouts for lock contention
-- **select.kqueue (stdlib)**: BSD kernel event notification — near-instant detection of DB changes via WAL file monitoring
-- **plistlib (stdlib)**: Binary plist decoding — notification payloads stored as bplist blobs in DB
-- **urllib.request (stdlib)**: Webhook HTTP POST — sufficient for fire-and-forget delivery with log-on-failure
-
-**Critical version requirements:**
-- Python 3.12+ for stable stdlib APIs (sqlite3 URI mode, plistlib binary plist support)
-- macOS Sequoia 15+ for target notification DB path and schema
-
-**What NOT to use:**
-- `requests` library — adds only external dependency for simple POST; urllib.request is sufficient
-- `watchdog` — cross-platform abstraction unnecessary; kqueue is native and proven
-- `asyncio` — adds complexity with no benefit; synchronous flow is simpler
-- `pyobjc` — massive dependency tree; DB-watching approach avoids Objective-C bridge entirely
+- `subprocess.run()` with `capture_output=True, text=True, timeout=N`: executes all three detection commands -- already used in codebase (line 77)
+- `ioreg -c IOHIDSystem -d 4`: reads HIDIdleTime in nanoseconds from IOKit registry -- well-documented, stable across macOS versions
+- `pgrep -x "Microsoft Teams"`: exact-match process name check -- fast, no permissions needed
+- `osascript -e <AppleScript>`: walks Teams AX tree for status text -- requires Accessibility permission, may not work with new Teams
 
 ### Expected Features
 
 **Must have (table stakes):**
-- **Teams bundle ID filtering** — match both `com.microsoft.teams2` (new Teams) and `com.microsoft.teams` (classic); without this, downstream drowns in system noise
-- **Sender + message extraction** — map notification fields (title→sender, body→message, subt→channel/chat) into structured data
-- **Chat/channel name extraction (subt)** — critical for routing; requires patching nchook to pass subtitle field
-- **Allowlist filtering** — require both sender name and body present; rejects reactions, call events, "X is typing", system alerts
-- **Webhook POST delivery** — JSON payload to configurable URL; log-and-skip on failure per project design
-- **State persistence** — track processed rec_ids to survive restarts without replaying history
-- **macOS Sequoia DB path support** — `~/Library/Group Containers/group.com.apple.usernoted/db2/db`
-- **Structured JSON payload** — parseable fields: sender, channel, message, timestamp, truncation flag
-- **Timestamp extraction** — messages without timestamps are unorderable
+- System idle detection via HIDIdleTime (most reliable signal, zero permissions)
+- Process-level Teams detection (if Teams is not running, always forward)
+- Configurable idle threshold (default 300s, matching Teams' own idle threshold)
+- Status-aware gating logic (forward/suppress decision engine)
+- Fallback chain assembly (AX -> idle -> process, graceful degradation)
+- Status metadata in webhook payload (detected_status, status_source, status_confidence)
+- "Always forward" escape hatch (config flag to disable gating entirely)
+- Graceful degradation without Accessibility permission
 
-**Should have (competitive):**
-- **Truncation detection flag** — macOS truncates previews at ~150 chars; flag `"truncated": true` signals incomplete message
-- **Dry-run mode** — print payloads without POSTing; essential for setup/debugging
-- **Graceful shutdown** — SIGTERM/SIGINT handler flushes state before exit
-- **Notification type classification** — distinguish DM vs channel vs mention; requires pattern matching on subt/title formats
-- **Health/heartbeat signal** — distinguish "no messages" from "daemon crashed"
+**Should have (differentiators):**
+- Teams AX status text reading (direct Teams status, highest fidelity -- but highest risk)
+- Teams menu bar icon status reading (potential AX alternative, unverified)
+- Status change event logging (trivial to implement, essential for debugging)
+- Per-status gating rules (configurable forward/suppress per status value)
 
 **Defer (v2+):**
-- **Startup replay window** — re-process last N minutes on startup (needs careful testing)
-- **Content-hash deduplication** — catch rare duplicate notifications with different rec_ids (only if observed in practice)
-- **Config reload without restart** — SIGHUP-triggered config re-read (convenience, not necessity)
-
-**Anti-features (explicitly avoid):**
-- Microsoft Graph API integration — defeats the purpose (avoiding OAuth complexity)
-- Retry queue for failed webhooks — adds state management complexity; log-and-skip is correct
-- Reply/response capabilities — requires Graph API; stay read-only
-- GUI/menu bar app — adds dependency surface; CLI daemon is correct
-- launchd service bundling — document separately; keep tool launchd-agnostic
+- Screen lock / session state detection (requires Core Graphics, not stdlib)
+- macOS Focus/DND mode detection (plist path varies by OS version)
+- Hysteresis / debounce for status transitions (only build if users report flapping)
+- Calendar integration (duplicates what Teams already provides)
+- Microsoft Graph API (breaks stdlib-only constraint and adds enormous complexity)
 
 ### Architecture Approach
 
-**Two-component separation:** Patched nchook (generic notification watcher) dispatches via subprocess to a wrapper script (Teams-specific filtering and webhook delivery). This maintains clean boundaries: nchook owns kqueue watching, SQLite reads, binary plist decoding, and rec_id state management. The wrapper owns Teams bundle ID filtering, allowlist logic, JSON construction, and HTTP POST. Process boundary allows independent testing and keeps each component focused.
+The status detection system integrates into the existing event loop as a pre-processing step. One call to `detect_user_status()` per poll cycle produces a status result dict with `status`, `source`, `confidence`, and `raw_value` fields. The `passes_status_gate()` function makes a forward/drop decision based on this result and the configured `forward_statuses` set. When gating suppresses forwarding, the daemon still queries notifications and advances the rec_id high-water mark to prevent replay. The webhook payload gains three underscore-prefixed metadata fields following the existing `_source` and `_truncated` convention.
 
 **Major components:**
-1. **kqueue WAL Watcher** — `select.kqueue()` with `KQ_FILTER_VNODE`/`NOTE_WRITE` on `db-wal` file; blocks until DB write, near-zero CPU when idle
-2. **DB Reader** — SQLite connection with `?mode=ro` URI; queries `WHERE rec_id > last_seen` for new records; read-only prevents interference with usernoted
-3. **Plist Decoder** — `plistlib.loads()` on binary BLOB from `data` column; extracts `titl`, `subt`, `body`, `date`, `app` keys
-4. **State Tracker** — high-water mark (single integer last_rec_id) persisted to JSON file; simpler than tracking set of all IDs
-5. **Callback Dispatcher** — `subprocess.call([handler, APP, TITLE, BODY, TIME, SUBT])` to wrapper script
-6. **Teams Filter** — match against configurable bundle ID set; allowlist requires sender+body present; blocklist for noise patterns
-7. **JSON Builder** — construct payload with sender, chat_name, body, timestamp, is_truncated flag
-8. **Webhook Poster** — `urllib.request.Request` with timeout; log-and-skip on failure
-
-**Critical data flow:** usernoted writes to SQLite → WAL file modified → kqueue fires → query for new rec_ids → decode plist blobs → subprocess call to handler → filter Teams messages → build JSON → POST to webhook → persist rec_id to state file.
-
-**State management decision:** State lives in nchook (recommended). nchook tracks last_rec_id in memory and persists to file after processing. Handler is stateless—receives args, filters, posts, exits. This avoids race conditions and keeps handler simple. Atomic file writes (write to temp, rename) prevent corruption.
+1. **Status detector** (`detect_user_status`) -- orchestrates the three-signal fallback chain, returns canonical status result dict
+2. **Signal functions** (`_detect_status_ax`, `_detect_idle_time`, `_detect_teams_process`) -- each handles its own errors internally, returns typed value or None
+3. **Status normalizer** (`_normalize_ax_status`) -- maps raw AX text to canonical status strings
+4. **Status gate** (`passes_status_gate`) -- forward/drop decision based on status and configured forward_statuses set
+5. **Config extension** (`load_config`) -- new keys: `status_enabled`, `status_ax_enabled`, `idle_threshold_seconds`, `forward_statuses`
+6. **Payload extension** (`build_webhook_payload`) -- adds `_detected_status`, `_status_source`, `_status_confidence`
 
 ### Critical Pitfalls
 
-1. **SQLite database locking causes silent data loss** — Default sqlite3 connection modes conflict with usernoted's WAL writes. **Avoid:** Always open read-only (`?mode=ro` URI), set `PRAGMA busy_timeout`, never hold transactions open long, handle `SQLITE_BUSY` gracefully. **Phase 1 blocker.**
+1. **subprocess.run() blocks the kqueue event loop** -- AX queries take 500ms-3s and compound during notification bursts. Prevention: check status once per poll cycle (not per notification), always use `timeout=` on every subprocess call, check status before processing batch.
 
-2. **kqueue on WAL file fires unreliably or misses events** — WAL checkpoints, file recreation, and event coalescing cause missed notifications. **Avoid:** Query for ALL new rec_ids after each event (not just one), implement fallback poll timer (5-10s), detect WAL inode changes and re-register. **Phase 1 blocker.**
+2. **osascript hangs indefinitely when Teams window is unavailable** -- AppleScript timeout semantics do not apply to System Events AX access. Prevention: always pass `timeout=5` to subprocess.run(), catch TimeoutExpired, pre-check Teams process before running osascript.
 
-3. **Sequoia DB path and schema divergence** — macOS versions change DB location and schema without documentation. **Avoid:** Detect macOS version, validate path exists on startup, introspect schema with `PRAGMA table_info`, fail loudly with clear errors. **Phase 1 blocker.**
+3. **Accessibility permission grants to the wrong app** -- macOS grants AX permission to the parent terminal, not osascript. Testing in one terminal succeeds, running from another fails silently. Prevention: probe AX at startup, detect parent terminal via TERM_PROGRAM, print actionable instructions.
 
-4. **Binary plist parsing fragility** — Notification plists have nested structure, abbreviated keys (`titl`/`subt`/`body`), and missing fields. **Avoid:** Use `plistlib.loads()`, always use `.get()` with defaults, log raw plist on parse failures, test with multiple notification types. **Phase 1-2 validation.**
+4. **New Teams (com.microsoft.teams2) has a broken AX tree** -- parent-child relationships are inconsistent, the old Electron walking method is dead. Prevention: validate AX results against known status strings, design the system to work well WITHOUT AX, treat AX as a nice-to-have enhancement.
 
-5. **Full Disk Access (FDA) permission not granted** — macOS sandbox silently fails reads of `~/Library/Group Containers/` without FDA. **Avoid:** Startup self-test (attempt DB read), detect zero records when DB exists, print actionable FDA instructions, document in README with screenshots. **Phase 1 blocker.**
-
-6. **Teams bundle ID fragmentation** — Multiple Teams versions (`com.microsoft.teams2`, `com.microsoft.teams`, potential beta/nightly) have different bundle IDs. **Avoid:** Use configurable set of IDs (not single string), log watched IDs on startup, scan DB for unknown "teams" IDs. **Phase 2 filtering.**
-
-7. **rec_id state persistence race conditions** — Crash between processing and persist causes duplicates; crash during file write corrupts state. **Avoid:** Atomic file writes (temp + rename), accept at-least-once delivery semantic (persist after webhook success), use high-water mark (simpler than set). **Phase 1 state management.**
-
-8. **Foreground suppression creates invisible gaps** — macOS/Teams suppress notifications for active/focused chats; messages arrive but no DB record. **Avoid:** Document limitation prominently, include notice in webhook payload, this is fundamental constraint of DB-watching approach. **Phase 3 documentation.**
-
-9. **Notification cleanup/purge causes negative rec_id delta** — macOS purges old notifications or recreates DB; persisted rec_id higher than MAX(rec_id) in DB means query returns zero forever. **Avoid:** On startup, compare persisted rec_id to `MAX(rec_id)`; reset if persisted > max; log warnings. **Phase 1 startup validation.**
-
-10. **Teams notification format variations break allowlist** — Sender in title vs subtitle vs combined; group chat vs channel vs 1:1 formats differ; reactions/meetings look like messages. **Avoid:** Content-based filters (not just field presence), configurable blocklist of noise patterns, log all filter decisions at DEBUG, accept some noise is unavoidable. **Phase 2 filtering.**
+5. **Gating logic silently drops notifications on UNKNOWN status** -- if all signals fail and UNKNOWN maps to "drop", the daemon silently loses messages. Prevention: fail-open policy -- UNKNOWN is in the default `forward_statuses` set. Better to get a duplicate than miss a message.
 
 ## Implications for Roadmap
 
-Based on research, suggested phase structure with strong dependency ordering:
+Based on research, suggested phase structure:
 
-### Phase 1: Core DB Watcher Foundation
-**Rationale:** Everything depends on nchook correctly watching the Sequoia DB and extracting the subtitle field. This is the critical path. No other phase can begin until DB watching, plist decoding, and state persistence are proven reliable.
+### Phase 1: Status Detection Core
 
-**Delivers:**
-- Patched nchook with Sequoia DB path detection
-- Binary plist decoding with `subt` extraction
-- Callback dispatch with 5 arguments (APP, TITLE, BODY, TIME, SUBT)
-- State file persistence (atomic writes, high-water mark)
-- Startup validation (FDA check, DB path exists, schema introspection)
-- kqueue + fallback poll timer for reliability
-- Read-only SQLite access with lock handling
+**Rationale:** Build the three signal functions and fallback chain orchestrator first. These are independent of the existing event loop and can be tested in isolation. Start with ioreg (guaranteed to work, no permissions), then pgrep (guaranteed to work), then AX (may not work). This order validates the fallback chain with working signals before tackling the uncertain AX signal.
 
-**Addresses features:**
-- macOS Sequoia DB path support (table stakes)
-- Chat/channel name extraction (table stakes)
-- State persistence (table stakes)
-- Timestamp extraction (table stakes)
+**Delivers:** `_detect_idle_time()`, `_detect_teams_process()`, `_detect_status_ax()` (placeholder AX script), `_normalize_ax_status()`, `detect_user_status()` orchestrator.
 
-**Avoids pitfalls:**
-- Pitfall 1: SQLite locking (read-only mode, busy_timeout)
-- Pitfall 2: kqueue unreliability (fallback timer, batch queries)
-- Pitfall 3: Sequoia path/schema divergence (detection, validation)
-- Pitfall 4: Plist parsing fragility (defensive `.get()`, error handling)
-- Pitfall 5: FDA permission failure (startup self-test, actionable error)
-- Pitfall 7: State persistence races (atomic writes)
-- Pitfall 9: DB purge/rec_id reset (startup MAX(rec_id) check)
+**Addresses:** System idle detection, process-level Teams detection, fallback chain assembly, graceful AX degradation.
 
-**Validation criteria:**
-- Test with concurrent writes (no SQLITE_BUSY crashes)
-- Kill -9 during operation, verify restart behavior (no state corruption)
-- Parse 5+ different notification types without error
-- Verify notifications captured during WAL checkpoint window
-- Test on fresh macOS user account without FDA (clear error message)
+**Avoids:** Pitfall 1 (blocks event loop) by establishing the "check once" pattern from the start. Pitfall 5 (ioreg parsing) by implementing correct nanosecond conversion immediately. Pitfall 7 (pgrep wrong match) by using `-x` exact match.
 
-**Needs research:** No—nchook's kqueue/SQLite approach is proven, stdlib APIs are well-documented. Execution is straightforward.
+### Phase 2: Config, Gating Logic, and Event Loop Integration
 
-### Phase 2: Teams Filtering and JSON Construction
-**Rationale:** With nchook reliably dispatching notifications, build the filtering layer that isolates Teams messages and the JSON formatting layer that structures data for webhook delivery. Filtering must handle Teams notification format variations (group vs channel vs 1:1) and reject noise (reactions, calls, meetings). This phase depends entirely on Phase 1's correct extraction of APP, TITLE, BODY, TIME, SUBT.
+**Rationale:** With detection functions in place, wire the config keys, gating decision, and event loop integration. This phase modifies the 4 existing functions (`load_config`, `run_watcher`, `build_webhook_payload`, `print_startup_summary`). The critical design decision -- always query and advance state even when gating suppresses -- must be implemented here.
 
-**Delivers:**
-- Wrapper script (shell or Python) receiving nchook args
-- Teams bundle ID filtering (configurable set: `com.microsoft.teams2`, `com.microsoft.teams`)
-- Allowlist logic (require sender+body present, not "Microsoft Teams" system alerts)
-- Blocklist for noise patterns (reactions, calls, meetings, typing indicators)
-- JSON payload construction with schema: `{sender, chat_name, body, timestamp, is_truncated, source}`
-- Truncation detection heuristic (length >= 148 chars)
-- Config file loading and validation (webhook URL, bundle IDs, log level)
+**Delivers:** `passes_status_gate()`, modified event loop with status check before batch processing, config keys (`status_enabled`, `status_ax_enabled`, `idle_threshold_seconds`, `forward_statuses`), webhook payload with status metadata, startup summary showing status config.
 
-**Addresses features:**
-- Teams bundle ID filtering (table stakes)
-- Sender + message extraction (table stakes)
-- Allowlist filtering (table stakes)
-- Structured JSON payload (table stakes)
-- JSON config file (table stakes)
-- Truncation detection flag (differentiator)
-- Dry-run mode (differentiator)
+**Addresses:** Status-aware gating logic, status metadata in webhook, "always forward" escape hatch, per-status gating rules.
 
-**Uses stack elements:**
-- `json` (config parsing, payload serialization)
-- `logging` (filter decisions at DEBUG)
+**Avoids:** Pitfall 10 (drops on UNKNOWN) by implementing fail-open from the start. Anti-Pattern 3 (not advancing state when gated) by always querying and advancing rec_id.
 
-**Avoids pitfalls:**
-- Pitfall 6: Bundle ID fragmentation (configurable set)
-- Pitfall 10: Format variations (content-based filters, blocklist)
+### Phase 3: AX Discovery and Permission Handling
 
-**Validation criteria:**
-- Test with both `com.microsoft.teams` and `com.microsoft.teams2`
-- Test with group chats, channels, DMs, reactions, calls, meetings
-- Verify truncation flag accuracy on long messages
-- Dry-run mode prints JSON without POSTing
-- Config validation rejects missing webhook URL
+**Rationale:** This phase requires interactive access to a running Teams instance and Accessibility Inspector. It cannot be planned purely from research. The AX script is a placeholder until empirically validated. This phase also adds the startup AX probe with actionable permission instructions.
 
-**Needs research:** No—filtering logic is heuristic-based, no external APIs or complex patterns. May need tuning after first real-world use, but not pre-planning research.
+**Delivers:** Real AppleScript for Teams AX status reading (or confirmed inability to read it), startup AX permission probe with user-friendly instructions, AX backoff logic (disable after consecutive failures, re-probe periodically).
 
-### Phase 3: Webhook Delivery and Hardening
-**Rationale:** With filtering producing clean JSON payloads, connect the output to the webhook endpoint and add operational polish (error handling, graceful shutdown, logging). This phase makes the daemon production-ready.
+**Addresses:** Teams AX status text reading, Accessibility permission handling, menu bar icon as alternative AX target.
 
-**Delivers:**
-- HTTP POST to webhook URL with JSON body
-- Timeout handling (5-10s, log-and-skip on timeout)
-- Error handling (log status code, response body on non-2xx)
-- Log-and-skip on webhook failure (no retries per project design)
-- Entry point script (run.sh) wiring nchook to handler
-- Graceful shutdown (SIGTERM/SIGINT handler, flush state)
-- Logging levels (INFO for deliveries, WARNING for failures, DEBUG for filter decisions)
-- End-to-end testing with real Teams notifications
-- Documentation of foreground suppression limitation
+**Avoids:** Pitfall 2 (osascript hangs) via timeout enforcement. Pitfall 3 (wrong permission target) via startup probe. Pitfall 4 (broken AX tree) via validation against known status strings. Pitfall 9 (entire contents slow) via targeted element path.
 
-**Addresses features:**
-- Webhook POST delivery (table stakes)
-- Graceful shutdown (differentiator)
+### Phase 4: Hardening and Polish
 
-**Uses stack elements:**
-- `urllib.request` (HTTP POST)
-- `signal` (shutdown handler)
-- `logging` (structured output)
+**Rationale:** After core functionality works, add resilience features that prevent edge-case failures. These are refinements on top of working signal collection and gating.
 
-**Avoids pitfalls:**
-- Pitfall 8: Foreground suppression (document in README, mention in payload)
+**Delivers:** Status change event logging, hysteresis for status transitions (if needed), sleep/wake cache invalidation, consecutive AX failure tracking, ioreg format change detection with warning logs.
 
-**Validation criteria:**
-- Webhook delivers successfully with correct Content-Type headers
-- Non-responsive endpoint (timeout) doesn't hang daemon
-- Burst of 10+ notifications all delivered
-- SIGTERM during operation cleanly saves state
-- Error logs include full context (payload, status, error)
+**Addresses:** Status change logging, fallback chain consistency during transitions, cache freshness after sleep/wake.
 
-**Needs research:** No—HTTP POST with urllib.request is straightforward. Error handling patterns are standard.
-
-### Phase 4: Optional Enhancements
-**Rationale:** After core functionality is proven, add operational conveniences that improve UX but are not blockers. These can be built incrementally based on real-world usage patterns.
-
-**Delivers (pick based on priority):**
-- Health/heartbeat signal (periodic log message or webhook POST)
-- Notification type classification (DM vs channel vs mention via pattern matching)
-- Startup replay window (re-process last N minutes on startup)
-- Config reload without restart (SIGHUP handler)
-
-**Deferred:**
-- Content-hash deduplication (only if duplicates observed)
-
-**Needs research:** Notification type classification may need research if Teams notification text patterns are unclear. Others are standard patterns.
+**Avoids:** Pitfall 6 (inconsistent status during transitions) via hysteresis. Pitfall 8 (stale cache after sleep) via monotonic time and gap detection. Pitfall 12 (ioreg format changes) via defensive logging.
 
 ### Phase Ordering Rationale
 
-**Dependency-driven:** Phase 1 is foundational—all components depend on nchook's correct extraction. Phase 2 consumes Phase 1's output (APP/TITLE/BODY/TIME/SUBT args). Phase 3 consumes Phase 2's output (filtered JSON payloads). This is a strict pipeline dependency.
-
-**Pitfall prevention timing:** The critical pitfalls (SQLite locking, kqueue reliability, FDA permissions, DB path detection) must be addressed in Phase 1—they are blockers to any functionality. Teams-specific pitfalls (bundle ID fragmentation, format variations) are Phase 2 concerns. Operational pitfalls (webhook failures, shutdown handling) are Phase 3 concerns.
-
-**Grouping by component boundary:** Phase 1 is "everything in nchook," Phase 2 is "everything in the wrapper script," Phase 3 is "integration and operational hardening." This aligns with the architectural separation and allows focused testing.
-
-**Risk mitigation:** Front-loading the hardest integration work (SQLite/kqueue/macOS permissions) into Phase 1 de-risks the project early. If these fail, the entire approach is wrong. Better to discover this in Phase 1 than after building filtering/webhook logic.
+- **Phases 1-2 before Phase 3:** The system must work without AX before investing in AX discovery. Research shows AX may be permanently broken for new Teams. Building idle+process detection first means the daemon delivers value even if Phase 3 discovers AX is non-viable.
+- **Phase 2 before Phase 3:** The gating logic and event loop integration define the contract for status results. AX discovery plugs into a tested framework rather than requiring simultaneous integration.
+- **Phase 4 last:** Hardening features (hysteresis, sleep/wake, logging) are refinements that require observing the system running. Building them before core functionality wastes effort if the core design changes.
+- **Dependencies are strict:** Phase 2 depends on Phase 1 (needs detection functions). Phase 3 depends on Phase 2 (needs the config/gating framework). Phase 4 depends on all previous phases (refines working system).
 
 ### Research Flags
 
-**Phases with standard patterns (skip research-phase):**
-- **Phase 1:** kqueue + SQLite + plistlib are well-documented stdlib APIs; nchook's approach is proven
-- **Phase 2:** Filtering logic is heuristic-based; config loading is standard JSON parsing
-- **Phase 3:** HTTP POST with urllib.request is straightforward; signal handlers are standard patterns
+Phases likely needing deeper research during planning:
+- **Phase 3 (AX Discovery):** The AppleScript AX tree path cannot be determined from research alone. Requires interactive Accessibility Inspector session with running Teams. LOW confidence on whether this signal is viable at all. Consider the Teams menu bar extension as an alternative AX target.
 
-**Phases that may need research if issues arise:**
-- **Phase 2 (notification type classification):** If Teams notification text patterns are unclear after initial testing, may need targeted research on Teams notification format variations. Not needed pre-planning—wait for real-world data.
-- **Phase 4 (startup replay window):** Time zone handling and DB timestamp formats may need investigation if added.
-
-**No pre-planning research needed.** The research conducted covers the domain thoroughly. Phase-specific research should be triggered only if unexpected issues arise during implementation (e.g., Sequoia schema differs from training data, Teams formats are unrecognizable).
+Phases with standard patterns (skip research-phase):
+- **Phase 1 (Detection Core):** ioreg and pgrep patterns are well-documented with HIGH confidence. subprocess.run() is already used in the codebase. Standard implementation.
+- **Phase 2 (Config/Gating/Integration):** Extends existing config/payload/loop patterns. The "always advance state" pattern is clearly defined. Standard implementation.
+- **Phase 4 (Hardening):** Hysteresis, logging, and cache management are standard software patterns. No domain-specific research needed.
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | All technologies are Python stdlib; verified Python 3.12.7 installed; stdlib APIs stable and well-documented |
-| Features | HIGH | Directly derived from PROJECT.md requirements and nchook's proven patterns; table stakes list aligns with project goals |
-| Architecture | MEDIUM-HIGH | nchook's approach is proven, but exact Sequoia DB schema column names not verified live; plist key names reconstructed from training data |
-| Pitfalls | MEDIUM-HIGH | SQLite/kqueue/FDA pitfalls are well-documented; Teams notification format variations are inferred (not observed on Sequoia directly) |
+| Stack | HIGH | All tools are stdlib or macOS system binaries. subprocess.run() pattern is proven in the codebase. No new dependencies. |
+| Features | MEDIUM | Table stakes and gating logic are well-understood. AX reading (the primary differentiator) has LOW confidence due to new Teams AX tree issues. |
+| Architecture | HIGH | Fallback chain pattern is established. Integration points are clearly identified. Only 4 existing functions need modification. ~200-250 new LOC. |
+| Pitfalls | HIGH | 13 pitfalls documented with clear prevention strategies. The critical ones (subprocess timeout, AX permission, broken AX tree) have well-defined mitigations. |
 
-**Overall confidence:** MEDIUM-HIGH
-
-Research is strong on technical approach (kqueue, SQLite, stdlib usage) and known macOS pitfalls (FDA, DB locking, WAL checkpoints). Uncertainty centers on Sequoia-specific details that can't be verified without live access: exact DB schema, exact plist key names, exact Teams notification formats. These are validation concerns for Phase 1 implementation, not roadmap blockers.
+**Overall confidence:** MEDIUM -- the system design and non-AX signals are solid (HIGH), but the highest-value signal (AX status text) has the lowest confidence. The architecture's fallback design means this risk is managed, not blocking.
 
 ### Gaps to Address
 
-**During Phase 1 implementation (verification needed):**
-- **Sequoia DB schema:** Verify table/column names with `sqlite3 <db-path> ".schema"`—confirm `record`, `app`, `data`, `rec_id`, `delivered_date` columns exist as expected
-- **Plist key names:** Decode a real Teams notification blob and confirm keys are `titl`, `subt`, `body`, `date`, `app`—if different, adjust parser
-- **Teams bundle ID:** Check which Teams version is installed (`com.microsoft.teams2` vs `com.microsoft.teams`)—verify with `SELECT DISTINCT identifier FROM app WHERE identifier LIKE '%teams%'`
-- **WAL file path:** Confirm `db-wal` exists alongside `db` file at expected location
-
-**During Phase 2 implementation (tuning needed):**
-- **Allowlist/blocklist patterns:** Collect sample notifications (DMs, channels, reactions, calls, meetings) and validate filter logic; tune as needed
-- **Truncation threshold:** Verify ~148 char limit is accurate for current macOS/Teams; adjust heuristic if needed
-
-**Not gaps—just uncertainty:** These are not missing research, they are "verify assumptions during implementation" items. The architecture and approach are sound regardless; implementation details may need minor adjustment.
-
-**No showstoppers identified.** All gaps are validation/tuning concerns, not fundamental unknowns. Roadmap can proceed with high confidence.
+- **New Teams AX tree viability:** Must be validated with Accessibility Inspector on the actual installed Teams version before writing the AppleScript. If the AX tree is non-functional, Phase 3 scope shrinks to "confirm AX is not viable, document findings, ensure idle+process fallback is sufficient."
+- **Teams menu bar extension AX properties:** The menu bar presence indicator (GA since Nov 2024) may expose status via AX description attribute. Completely unverified. Could be an alternative to main window AX walking if the main window tree is broken.
+- **Teams process name on target machine:** "Microsoft Teams" is the expected name for pgrep, but this must be verified once on the target machine. The process name is configurable in the proposed config, so runtime discovery is straightforward.
+- **time.monotonic() behavior during macOS sleep:** Python docs say monotonic clock "may or may not include time during sleep" and this varies by platform. Must verify on macOS Sequoia whether monotonic time advances during sleep. This affects cache invalidation correctness.
+- **Karabiner-Elements HIDIdleTime edge case:** Known issue where keyboard input may not reset HIDIdleTime when using Karabiner. Document as a known limitation rather than solving it.
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- `.planning/PROJECT.md` — project requirements, constraints, out-of-scope items
-- Python 3.12 stdlib documentation — `sqlite3`, `plistlib`, `select.kqueue`, `urllib.request` (stable APIs, unlikely to change)
-- macOS kqueue documentation — BSD kernel API (stable, well-documented)
-- SQLite WAL mode documentation — checkpoint behavior, read-only access patterns
+- [Python 3.12 subprocess documentation](https://docs.python.org/3.12/library/subprocess.html) -- subprocess.run() API, timeout, capture_output
+- [Apple Mac Automation Scripting Guide](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/AutomatetheUserInterface.html) -- UI scripting, Accessibility requirements
+- [Apple IOKit Registry docs](https://developer.apple.com/library/archive/documentation/DeviceDrivers/Conceptual/IOKitFundamentals/TheRegistry/TheRegistry.html) -- ioreg structure, IOHIDSystem
+- [DSSW: Inactivity and Idle Time on OS X](https://www.dssw.co.uk/blog/2015-01-21-inactivity-and-idle-time/) -- HIDIdleTime nanosecond format, parsing patterns
+- [Scripting OS X: AppleScript Security and Privacy](https://scriptingosx.com/2020/09/avoiding-applescript-security-and-privacy-requests/) -- AX permission model
+- Existing nchook.py subprocess usage (line 77-83, `detect_db_path`) -- proven pattern in codebase
 
 ### Secondary (MEDIUM confidence)
-- nchook project architecture — kqueue-based notification watching, subprocess dispatch pattern (described in PROJECT.md; source code not reviewed)
-- macOS notification center DB internals — schema reconstructed from training data (Apple does not document; community reverse-engineering efforts)
-- macOS Sequoia notification DB path — confirmed as `~/Library/Group Containers/group.com.apple.usernoted/db2/db` in PROJECT.md
+- [Microsoft Community: Teams AX tree issue](https://techcommunity.microsoft.com/discussions/teamsdeveloper/enable-accessibility-tree-on-macos-in-the-new-teams-work-or-school/4033014) -- New Teams AX tree is broken
+- [Karabiner-Elements issue #385](https://github.com/pqrs-org/Karabiner-Elements/issues/385) -- HIDIdleTime edge case
+- [Microsoft: Teams Menu Bar Icon for Mac](https://websites.uta.edu/oit/2024/10/16/microsoft-teams-menu-bar-icon-for-mac-devices/) -- Menu bar presence indicator
+- [Helge Klein: Identifying MS Teams Application Instances](https://helgeklein.com/blog/identifying-ms-teams-application-instances-counting-app-starts/) -- Teams process names
+- [GitHub: TeamsStatusMacOS](https://github.com/RobertD502/TeamsStatusMacOS) -- Alternative status detection approaches
 
 ### Tertiary (LOW confidence, needs validation)
-- Binary plist key names (`titl`, `subt`, `body`) — training data knowledge; should be verified against live Sequoia DB
-- Teams notification format patterns — training data knowledge; may have changed post-cutoff; needs validation with real notifications
-- macOS Sequoia Python version (3.12+) — verified 3.12.7 is installed on this machine; assumed via Xcode CLT but not verified explicitly
+- [Apple Developer Forums: AX elements only exposed with VoiceOver active](https://developer.apple.com/forums/thread/756895) -- AX tree gating behavior
+- [Electron issue #7206](https://github.com/electron/electron/issues/7206) -- AXManualAccessibility (likely does not apply to new WebKit Teams)
+- [Apple Developer Forums: HIDIdleTime not reset on headless Mac](https://developer.apple.com/forums/thread/721530) -- Edge case for non-desktop setups
 
 ---
 *Research completed: 2026-02-11*

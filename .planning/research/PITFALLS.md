@@ -1,423 +1,474 @@
-# Pitfalls Research
+# Domain Pitfalls
 
-**Domain:** macOS notification interception via SQLite database watching (Teams-specific)
+**Domain:** Status detection integration for macOS notification daemon (v1.1 milestone)
 **Researched:** 2026-02-11
-**Confidence:** MEDIUM-HIGH (domain expertise from training data; no live verification of Sequoia-specific DB schema possible in this session)
+**Confidence:** MEDIUM (AppleScript AX behavior verified via multiple community sources; ioreg parsing verified via Apple Developer Forums; subprocess integration based on Python docs + training data)
+
+**Context:** Adding three-signal status detection (AppleScript AX tree, ioreg HIDIdleTime, pgrep process check) to an existing 849 LOC Python daemon that uses a kqueue + fallback-poll event loop. All external checks run via `subprocess.run()` / `subprocess.check_output()`. This file covers pitfalls specific to ADDING these features, not the existing v1.0 daemon pitfalls (those are addressed and shipped).
+
+---
 
 ## Critical Pitfalls
 
-### Pitfall 1: SQLite Database Locking Causes Silent Data Loss
+Mistakes that cause the daemon to hang, miss notifications, or silently stop working.
+
+### Pitfall 1: subprocess.run() Blocks the kqueue Event Loop
 
 **What goes wrong:**
-The macOS notification center daemon (`usernoted`) actively writes to the SQLite database. Opening the database with the default `sqlite3` connection mode and running queries can encounter `SQLITE_BUSY` or `SQLITE_LOCKED` errors. If these are not handled, the watcher silently misses notifications that arrived during the locked period. Worse, if the connection uses WAL mode improperly or holds read transactions open too long, it can interfere with `usernoted`'s writes, potentially causing macOS to stop writing notifications or to rotate/recreate the database file.
+The daemon's event loop uses `kq.control([kev], 1, poll_interval)` with a 5-second timeout. When a notification arrives, the loop processes it -- and if status detection calls `subprocess.run(["osascript", ...])` synchronously, the entire event loop blocks until osascript returns. AppleScript Accessibility tree walks can take 500ms-3s for a complex app like Teams. ioreg is faster (~50-100ms) but still blocks. During this blocking window, kqueue events are buffered but not consumed, and if multiple notifications arrive in a burst (common in meeting chats), each notification triggers a sequential subprocess call. Ten notifications times 2 seconds of AppleScript = 20 seconds of blocked event loop. New kqueue events queue but the daemon appears frozen.
 
 **Why it happens:**
-Developers treat the notification database like their own application database. It is not -- it is owned by another process (`usernoted`). The watcher is a read-only parasite on someone else's database. Default SQLite behavior (journal_mode=delete) will try to take shared locks that conflict with `usernoted`'s WAL-mode writes. Even in WAL mode, a long-running read transaction prevents WAL checkpointing, eventually bloating the WAL file.
+Developers think "subprocess is fast, it's just a quick shell command." They're correct for ioreg (~50ms) but wrong for osascript with AX tree walking (500ms-3000ms). The problem compounds during notification bursts because status is checked per-notification rather than cached.
 
-**How to avoid:**
-- Open the database in read-only mode: `sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)`
-- Set `PRAGMA journal_mode=wal` on the read connection (matches the DB's actual mode, avoids implicit mode conversion attempts)
-- Never hold a transaction open longer than needed. Execute the query, fetch results, close immediately. Do not keep a cursor open between poll cycles.
-- Set a busy timeout: `connection.execute("PRAGMA busy_timeout = 1000")` so transient locks are retried rather than errored
-- Handle `sqlite3.OperationalError` (database is locked) gracefully -- log and retry on next poll cycle rather than crashing
+**Consequences:**
+- Notifications pile up; processing latency jumps from <100ms to 20+ seconds during bursts
+- If webhook POST also blocks (up to 10s timeout per current code), total blocking is subprocess + webhook per notification
+- kqueue events may be lost if the OS event buffer fills (unlikely but possible under sustained load)
+- User perceives the daemon as "laggy" or "stuck"
 
-**Warning signs:**
-- Intermittent `sqlite3.OperationalError: database is locked` in logs
-- Notifications appearing in macOS UI but not being captured by the watcher
-- WAL file (`db-wal`) growing unboundedly on disk
-- `usernoted` process using elevated CPU
+**Prevention:**
+- Cache status results with a TTL. Status changes slowly (minutes, not seconds). A 30-60 second cache means at most one subprocess call per TTL period, not one per notification.
+- Check status ONCE per poll cycle (before processing the notification batch), not per notification. The status is the same for all notifications in a single batch.
+- Always use `timeout=` on every `subprocess.run()` call. Never call subprocess without a timeout.
+- Consider the call ordering: check status first (cheap cached lookup), skip the batch if Available, only then process individual notifications. This avoids doing per-notification work that will be dropped anyway.
 
-**Phase to address:**
-Phase 1 (Core DB Watcher) -- this is foundational. The database connection setup must be correct from the first working prototype.
+**Detection:**
+- Log timestamps around subprocess calls; any call >500ms warrants investigation
+- Monitor notification processing latency; sudden spikes correlate with status checks
+
+**Phase to address:** First implementation plan -- the caching and "check once per cycle" pattern must be the architectural decision before any subprocess code is written.
 
 ---
 
-### Pitfall 2: kqueue on WAL File Fires Unreliably or Misses Events
+### Pitfall 2: osascript Hangs Indefinitely When Teams Window Is Not Available
 
 **What goes wrong:**
-nchook uses `kqueue` with `KQ_FILTER_VNODE` and `KQ_NOTE_WRITE` on the WAL file (`db-wal`) to detect new notifications. This has several failure modes:
-1. **WAL checkpoint collapses the WAL**: When `usernoted` checkpoints, data moves from WAL back to the main DB file. If the watcher only monitors the WAL file, it can miss notifications that were checkpointed before the next kqueue event.
-2. **kqueue event coalescing**: Multiple rapid writes to the WAL produce a single kqueue event. If the handler processes only one notification per event, it misses the rest.
-3. **WAL file recreation**: macOS can delete and recreate the WAL file (e.g., after a DB vacuum or usernoted restart). The kqueue file descriptor becomes stale -- it references the old (now deleted) inode. The watcher stops receiving events permanently with no error.
-4. **File descriptor limits**: kqueue watches consume file descriptors. Not a practical limit for one DB, but matters if the approach is extended.
+The AppleScript to read Teams status walks the Accessibility tree via System Events. If Teams is not running, is minimized with no windows, is in a broken UI state, or is displaying a modal dialog (e.g., update prompt), the AppleScript may hang waiting for a response that never comes. AppleScript's `with timeout` statement only applies to commands sent to application objects, not to all operations. The `osascript` process blocks forever, and because `subprocess.run()` without `timeout=` blocks the caller, the daemon hangs permanently.
 
 **Why it happens:**
-kqueue watches file descriptors (inodes), not file paths. When the file is replaced, the FD points to nothing. Also, kqueue is a notification that "something changed," not "here's what changed" -- you must re-query the DB after every event, and you must query for ALL new records, not just one.
+AppleScript's timeout semantics are counter-intuitive. The `with timeout of N seconds` construct does NOT apply universally -- it only works for Apple Events sent to applications, not for System Events UI element access. Developers test when Teams is running and healthy, never when it is absent, hung, or showing unexpected UI. The osascript process waits for a response from the AX framework that may never arrive.
 
-**How to avoid:**
-- After every kqueue event, query for ALL `rec_id` values greater than the last processed `rec_id`, not just one row. Process the entire batch.
-- Implement a fallback poll timer (e.g., every 5-10 seconds) that queries the DB regardless of kqueue events. This catches anything missed during WAL checkpoints or coalesced events.
-- Detect WAL file replacement by periodically `stat()`-ing the WAL file and comparing the inode number. If it changes, re-register the kqueue watch on the new file descriptor.
-- Alternatively, watch the directory containing the DB files for `KQ_NOTE_WRITE` as a secondary trigger.
-- nchook watches only the WAL file -- verify this behavior in the fork. If nchook doesn't handle WAL recreation, patch it.
+**Consequences:**
+- Daemon hangs permanently (requires kill -9 to recover)
+- No notifications processed until daemon is restarted
+- No error message -- the process is just stuck in subprocess.run()
 
-**Warning signs:**
-- Watcher stops receiving events after running for hours/days (stale FD)
-- Notifications arrive in macOS UI but watcher only picks them up on restart
-- Burst of notifications arrives but only one is processed
-- Watcher works fine for minutes but "stalls" periodically (checkpoint window)
+**Prevention:**
+- ALWAYS pass `timeout=5` (or similar) to `subprocess.run()`. This is non-negotiable.
+- Catch `subprocess.TimeoutExpired` explicitly and treat it as "AX unavailable, fall back to next signal."
+- Before running osascript, check if Teams is running via pgrep first (fast, <10ms). If Teams is not running, skip osascript entirely.
+- Structure the code so that subprocess timeout is the OUTER defense and a pre-check is the INNER optimization:
+  ```python
+  def get_ax_status():
+      # Fast pre-check
+      if not is_teams_running():
+          return None  # skip osascript entirely
+      try:
+          result = subprocess.run(
+              ["osascript", "-e", SCRIPT],
+              capture_output=True, text=True, timeout=5
+          )
+          ...
+      except subprocess.TimeoutExpired:
+          logging.warning("osascript timed out (Teams UI unresponsive?)")
+          return None  # fall back
+  ```
 
-**Phase to address:**
-Phase 1 (Core DB Watcher) -- the watching mechanism is the heart of the system. The fallback poll timer should be implemented alongside kqueue from the start, not as an afterthought.
+**Detection:**
+- Log every subprocess timeout at WARNING level
+- Track consecutive timeouts; 3+ in a row suggests Teams is in a broken state
+
+**Phase to address:** First implementation plan -- the timeout parameter is line 1 of the subprocess call, not an afterthought.
 
 ---
 
-### Pitfall 3: Sequoia DB Path and Schema Divergence
+### Pitfall 3: Accessibility Permission Grants to the Wrong App (Terminal vs. osascript vs. Python)
 
 **What goes wrong:**
-macOS Sequoia (15.x) changed the notification center database path from the pre-Sequoia location. The PROJECT.md notes the Sequoia path as `~/Library/Group Containers/group.com.apple.usernoted/db2/db`. The original nchook hardcodes the pre-Sequoia path (`~/Library/Group Containers/group.com.apple.usernoted/db2/db` on some versions, or the older `~/Library/Application Support/NotificationCenter/` path on pre-Ventura). If the path detection is wrong, the daemon opens the wrong file or no file and silently produces zero notifications.
-
-Beyond the path, the DB schema itself can change between macOS versions. Column names, table names, and the structure of the binary plist stored in the `data` column may differ. Sequoia may have added, renamed, or reorganized columns. Code that assumes specific column names will break on schema changes.
+macOS Accessibility permission is granted to the PARENT APPLICATION that spawns the process, not to osascript itself. When the daemon runs from Terminal.app, it is Terminal.app that needs Accessibility permission. When run from iTerm2, it is iTerm2. When run via launchd (future), the permission target changes again. Developers grant permission to one terminal, test successfully, then the daemon fails silently when launched from a different context. The error is `"osascript is not allowed assistive access"` on stderr, returncode 1 -- but if stderr is not checked, this looks like "no status found" rather than "permission denied."
 
 **Why it happens:**
-Apple does not document or guarantee the notification center database schema. It is a private implementation detail. Each major macOS version can change it without notice. Developers test on one version and assume stability.
+macOS Accessibility permissions are per-application, determined by the code-signed bundle of the process that makes the AX calls. When osascript is launched as a child of Terminal.app, it inherits Terminal.app's Accessibility grant. This is documented but not obvious. Developers test in their usual terminal and forget that the permission is terminal-specific.
 
-**How to avoid:**
-- On startup, detect the macOS version (`platform.mac_ver()`) and select the DB path accordingly
-- Validate the DB path exists before starting the watcher. Fail loudly with a clear error message if the file is not found.
-- On startup, introspect the actual schema: `PRAGMA table_info(record)` (or whatever the table is named). Log the schema. Compare against expected columns and warn if unexpected columns are found or expected columns are missing.
-- Do not hardcode column indices. Use column names from the query or use `row_factory = sqlite3.Row` for dict-like access.
-- Add a startup self-test: query the DB, parse one notification, verify the expected fields (app, title, subtitle, body) are extractable. If not, fail with a diagnostic message.
+**Consequences:**
+- AX signal always returns None/error, daemon permanently falls back to idle+process signals
+- User doesn't realize Accessibility permission is needed (they already granted FDA for v1.0)
+- Different from FDA: FDA is for file access, Accessibility is for UI element inspection. Users must grant BOTH permissions, to potentially different apps.
 
-**Warning signs:**
-- Zero notifications captured despite Teams notifications visibly arriving
-- `sqlite3.OperationalError: no such table` or `no such column` on startup
-- Binary plist parsing returns empty dicts or unexpected structure
-- The daemon starts without errors but webhook is never called
+**Prevention:**
+- On startup, attempt a minimal AX probe (e.g., `osascript -e 'tell application "System Events" to get name of first process'`). If this returns error 1 with "not allowed assistive access" in stderr, print actionable instructions: "Accessibility permission required. Go to System Settings > Privacy & Security > Accessibility and add [detected terminal app]."
+- Detect the parent terminal: `os.environ.get("TERM_PROGRAM", "your terminal")` gives "Apple_Terminal", "iTerm.app", "vscode", etc. Include this in the error message.
+- Distinguish between "Accessibility not granted" (fixable, print instructions) and "Teams not running" (normal, fall through silently). Check stderr content, not just return code.
+- Log at startup whether AX signal is available or degraded: "AX status: AVAILABLE" vs "AX status: UNAVAILABLE (Accessibility permission not granted for iTerm2)"
 
-**Phase to address:**
-Phase 1 (Core DB Watcher) -- path detection and schema validation must be the first thing implemented. A startup self-test should be part of the MVP.
+**Detection:**
+- osascript returncode == 1 AND stderr contains "not allowed assistive access"
+- Status detection always uses fallback signals, never AX, despite Teams being visible on screen
+
+**Phase to address:** First implementation plan -- the AX probe should run at startup alongside FDA validation. Print clear instructions for both permissions.
 
 ---
 
-### Pitfall 4: Binary Plist Parsing Fragility
+### Pitfall 4: New Teams (com.microsoft.teams2) Has a Broken Accessibility Tree
 
 **What goes wrong:**
-The notification data is stored as a binary plist (bplist) in a BLOB column. Parsing this correctly is the most fragile part of the system. Failure modes include:
-1. **Nested structure assumptions**: The plist may contain nested dicts/arrays. Assuming `data["title"]` when it's actually `data["req"]["titl"]` or some other nested path silently returns `None`.
-2. **Key name changes**: Apple uses abbreviated keys (`titl`, `subt`, `body`, `app` or similar). These abbreviations can change between macOS versions.
-3. **Multiple plist formats**: Some records may use XML plist instead of binary plist. `plistlib.loads()` handles both, but if code assumes binary-only and uses a different parser, XML records break.
-4. **Encoding edge cases**: Notification bodies can contain emoji, Unicode characters, RTL text, and even null bytes in malformed plists. String handling must be UTF-8 safe.
-5. **Missing keys**: Not all notifications have all fields. A "call" notification has no body. A system notification has no subtitle. Accessing missing keys without `.get()` crashes the parser.
+The "new" Microsoft Teams on macOS (bundle ID `com.microsoft.teams2`) has known issues with its Accessibility tree. Community reports indicate the tree is malformed: parent-child relationships are inconsistent (element A lists B as child, but B's parent is C, not A). The tree traversal that worked on the old Electron-based Teams may return incorrect elements, wrong text, or fail entirely on the new native Teams. Worse, this can change between Teams updates without notice.
 
 **Why it happens:**
-Developers dump one notification's plist, see the structure, hardcode paths to fields, and assume all notifications match. They don't -- different apps, different notification types, and different macOS versions produce different structures.
+The new Teams was rewritten from Electron to a native macOS app. The Accessibility tree implementation was not prioritized. Microsoft Community Hub discussions (thread 4033014) confirm that the old method of exposing the AX tree via a call to Teams no longer works in the new version. The tree structure is app-version-dependent and not under our control.
 
-**How to avoid:**
-- Use `plistlib.loads()` from the standard library -- it handles both binary and XML plists
-- Always use `.get()` with defaults: `data.get("titl", "")` not `data["titl"]`
-- Log the raw plist structure (at DEBUG level) for notifications that fail to parse, so you can diagnose format changes
-- Build the parser to be defensive: if title/body/subtitle extraction fails, skip the notification and log it rather than crashing
-- Create test fixtures with real notification plists from Sequoia for regression testing
-- After extracting the plist dict, normalize keys to a standard internal format before passing downstream
+**Consequences:**
+- AppleScript returns wrong status text or empty string
+- AX signal appears to work (no error) but returns incorrect data
+- Status detection makes wrong gating decisions (drops notifications when user is actually Away)
+- Silent data loss -- the worst kind of bug
 
-**Warning signs:**
-- `KeyError` or `TypeError` exceptions in the plist parsing code
-- Some notifications parse correctly but others silently produce empty fields
-- After macOS update, parser starts returning empty dicts
-- Emoji-heavy messages produce truncated or garbled output
+**Prevention:**
+- Validate AX results against known status strings: {"Available", "Away", "Busy", "Do not disturb", "Be right back", "Offline", "Out of office"}. If the extracted text is not in this set, treat the result as UNKNOWN and fall back.
+- Never trust AX output blindly. Log every extracted status string at DEBUG level so you can audit what's being read from the tree.
+- Build the AX script to be specific about the UI path (e.g., targeting a specific window role/subrole) rather than using `entire contents` which will break on tree changes.
+- Prepare for the AX signal to be permanently unavailable for new Teams. The fallback chain exists for exactly this reason. Design the system so it works well WITHOUT AX, and AX is a nice-to-have enhancement.
+- Pin the AppleScript to specific UI element paths discovered via Accessibility Inspector, and document how to re-discover the path when Teams updates.
 
-**Phase to address:**
-Phase 1 (Core DB Watcher) for initial parsing, but Phase 2 (Teams Filtering) must validate that the parsed structure contains the expected Teams-specific fields. Create a dedicated parsing module with extensive error handling from the start.
+**Detection:**
+- AX returns text not in the known status set
+- AX returns empty string despite Teams being visible and running
+- Status confidence is always "low" (never AX-sourced) despite permissions being correct
+
+**Phase to address:** Research phase (before first implementation) -- verify the AX tree structure with Accessibility Inspector on the actual Teams version installed. If the tree is broken, consider whether AX signal is viable at all or if idle+process is sufficient.
 
 ---
 
-### Pitfall 5: Teams Bundle ID Fragmentation
+### Pitfall 5: ioreg HIDIdleTime Output Format Assumptions Break Silently
 
 **What goes wrong:**
-Microsoft Teams on macOS exists in multiple versions with different bundle identifiers:
-- `com.microsoft.teams2` -- the "new" Teams (Electron-based, then later native)
-- `com.microsoft.teams` -- classic/legacy Teams
-- Potentially others: `com.microsoft.teams.nightly`, `com.microsoft.teams.beta`, or future bundle IDs if Microsoft rebundles again
-
-Filtering on a single bundle ID misses notifications from the other version. Users may have both installed, or may be migrated from classic to new Teams without realizing it. The wrapper script must match ALL known Teams bundle IDs.
-
-Additionally, the bundle ID is stored in the notification database record, but the exact column/field name and format may vary. It might be stored as part of the binary plist, or in a separate column like `app_id` or `bundleid`.
+The ioreg command output for HIDIdleTime looks like:
+```
+    |   "HIDIdleTime" = 4523456789
+```
+Parsing this with regex (e.g., `re.search(r'HIDIdleTime.*?(\d+)', output)`) seems simple, but several things can go wrong:
+1. **The number is in nanoseconds**, not seconds or milliseconds. Forgetting to divide by 1,000,000,000 gives astronomically wrong idle times.
+2. **The output format includes leading whitespace, pipe characters, and quotes** that can vary between macOS versions. A rigid regex breaks if Apple changes the formatting.
+3. **ioreg may not include HIDIdleTime at all** if IOHIDSystem is not loaded (rare, but possible on headless/remote setups or after sleep/wake).
+4. **Integer overflow in Python is not a concern** (Python handles arbitrary precision), but downstream JSON serialization may truncate the raw nanosecond value if it exceeds 64-bit float precision (~9.007 * 10^15 nanoseconds = ~104 days).
+5. **The HIDIdleTime key appears multiple times** in ioreg output. Naive parsing may grab the wrong one.
 
 **Why it happens:**
-Microsoft's Teams product has been through multiple rebrandings and architectural changes. The classic-to-new migration left fragmented bundle IDs. Developers test with whatever version they have installed and miss the other.
+Developers test by running `ioreg -c IOHIDSystem | grep HIDIdleTime` in Terminal, see the output, write a regex, and assume stability. They don't handle the "key not found" case, the "wrong instance" case, or the unit conversion correctly.
 
-**How to avoid:**
-- Filter with a set/list of bundle IDs, not a single string: `{"com.microsoft.teams", "com.microsoft.teams2"}`
-- Make the bundle ID list configurable in the JSON config file so users can add future bundle IDs without code changes
-- On startup, log which bundle IDs are being watched
-- Periodically (or on first run), scan the DB for distinct app identifiers that contain "teams" (case-insensitive) to discover unexpected bundle IDs
+**Consequences:**
+- Idle time always reads as 0 (wrong regex captures nothing, default is 0) -- daemon thinks user is always active, never forwards notifications
+- Idle time calculated in wrong units -- 4.5 billion "seconds" instead of 4.5 seconds, daemon thinks user has been idle for 142 years
+- ioreg output changes on macOS update, regex stops matching, idle signal silently fails
 
-**Warning signs:**
-- Notifications from one Teams version are captured but not the other
-- User reports "it stopped working" after a Teams update (bundle ID changed)
-- DB scan shows Teams notifications with a bundle ID not in the filter list
+**Prevention:**
+- Use a robust regex: `r'"HIDIdleTime"\s*=\s*(\d+)'` -- this handles whitespace variations around the `=` sign.
+- Always divide by 1_000_000_000 to convert nanoseconds to seconds. Add a comment explaining the unit.
+- Handle `None` from `re.search()` -- if the regex doesn't match, return None (signal unavailable), do not default to 0.
+- Use `ioreg -c IOHIDSystem -d 4` with `-d` flag to limit depth and reduce output size / parsing ambiguity.
+- Add a sanity check: if idle_seconds > 86400 (more than one day), something is probably wrong. Log a warning.
+- Unit test the parser with real ioreg output captured from the target machine.
 
-**Phase to address:**
-Phase 2 (Teams Filtering) -- bundle ID handling is core to the filtering logic. The configurable list should be established in Phase 1's config file structure.
+**Detection:**
+- Idle signal always returns 0 or always returns a huge number
+- Status decisions never use idle signal (always falls through to process check)
+- After macOS update, idle detection stops working
+
+**Phase to address:** First implementation plan -- the parser function should be written with explicit unit conversion, regex robustness, and None handling from the start.
 
 ---
 
-### Pitfall 6: Foreground Suppression Creates Invisible Gaps
+## Moderate Pitfalls
+
+Mistakes that cause incorrect behavior or degraded reliability but don't hang the daemon.
+
+### Pitfall 6: Fallback Chain Produces Inconsistent Status During Transitions
 
 **What goes wrong:**
-When a Teams chat or channel is actively focused (in the foreground), macOS and/or Teams suppress notifications for that conversation. Messages arrive in Teams but no notification is generated, so no record appears in the notification center database. The watcher has zero visibility into these messages. This creates gaps in the captured message stream that are invisible -- there's no "notification was suppressed" record, just silence.
+The three-signal chain (AX -> idle+process -> process-only) produces status at different confidence levels. During status transitions (user returns to computer, Teams auto-changes from Away to Available), the signals disagree:
+- AX says "Available" (updated instantly by Teams)
+- HIDIdleTime still shows >300 seconds (hasn't been reset yet because user moved mouse but timer updates lag)
+- pgrep says "running" (no change)
 
-Users expect the system to capture "all messages" and are confused when messages from their active conversations are missing.
+If AX fails (timeout) during this transition, the daemon falls to idle+process, which still reads the stale idle value, and concludes the user is Away. It forwards a notification that should have been dropped (user is actively looking at Teams).
 
 **Why it happens:**
-This is by design -- macOS and Teams both suppress notifications for the active/focused conversation to avoid redundant alerts. The notification center database only contains notifications that were actually generated, not all messages.
+The three signals have different update latencies. AX reflects Teams' internal state (near-instant). HIDIdleTime reflects OS-level input (updates within milliseconds of input, but the subprocess call to read it introduces latency). pgrep is binary (running/not running) and says nothing about status. During transitions, signals are temporarily contradictory.
 
-**How to avoid:**
-- Document this limitation prominently. This is not a bug to fix but a fundamental constraint of the DB-watching approach.
-- In the webhook JSON payload, include a `"notice": "Messages from active/focused Teams chats are not captured"` or similar field so downstream consumers are aware.
-- Consider adding a `coverage_gap` boolean or similar metadata to indicate when a long silence from a previously active sender *might* indicate foreground suppression (heuristic only, not reliable).
-- The PROJECT.md already lists this as a known limitation -- ensure it's surfaced to end users of the webhook, not just developers.
+**Prevention:**
+- When falling back from AX to idle+process, add a brief grace period. If AX was recently available (within last 60 seconds) but just timed out, treat the status as UNKNOWN rather than inferring from stale signals.
+- Never combine AX status with idle time in the same decision. Use one signal chain, not a hybrid: AX result is authoritative when available, idle+process is the backup, not a cross-check.
+- Add hysteresis to status transitions: require the same status from 2 consecutive checks before changing the gating decision. This prevents flip-flopping during transitions.
+- Log every status change with the source signal so you can audit transition behavior.
 
-**Warning signs:**
-- Users report missing messages that they can see in Teams but that never appeared in the webhook
-- Long gaps in notifications from a conversation that then suddenly resume (user switched away from that chat)
-- "Completeness" testing shows missed messages that correlate with the user's active Teams window
+**Detection:**
+- Notifications forwarded/dropped incorrectly in the minutes after the user returns or leaves
+- Status flips rapidly between Available and Away in logs (oscillation)
+- Webhook payloads show `status_source: "idle"` immediately after a `status_source: "ax"` reading
 
-**Phase to address:**
-Phase 3 (Webhook Delivery / JSON formatting) -- the limitation should be documented in the webhook payload design. Phase 1 should document it in logs/startup output.
+**Phase to address:** Second implementation plan (after basic signals work) -- hysteresis and grace periods are refinements on top of working signal collection.
 
 ---
 
-### Pitfall 7: rec_id State Persistence Race Conditions
+### Pitfall 7: pgrep Matches Wrong Process or Multiple Processes
 
 **What goes wrong:**
-nchook tracks processed notifications by `rec_id` to avoid duplicates. The project adds file-based persistence so this survives restarts. Several things go wrong:
-1. **Crash between process and persist**: If the daemon processes a notification (sends webhook) but crashes before writing the rec_id to the state file, it will re-send that notification on restart (duplicate).
-2. **Write-then-crash**: If the daemon writes the rec_id to the state file but the webhook POST hasn't completed yet, the notification is marked as processed but never actually delivered (lost).
-3. **State file corruption**: Writing JSON/text state files is not atomic. A crash mid-write produces a truncated/corrupt state file. On restart, the daemon either crashes or resets to zero (reprocessing everything).
-4. **rec_id gaps**: Notification `rec_id` values in the SQLite DB may not be strictly sequential. If the daemon tracks "highest rec_id seen" instead of a set of processed rec_ids, gaps can cause it to skip unprocessed notifications with lower rec_ids that arrived out of order.
+`pgrep -x "Microsoft Teams"` or `pgrep -f "com.microsoft.teams"` can match:
+1. Multiple processes (Teams spawns helper processes with similar names)
+2. The wrong process entirely (pgrep without `-x` does substring matching: "Microsoft Teams Helper" matches "Microsoft Teams")
+3. Zero processes even when Teams is running (if the process name doesn't match expectations -- Teams renamed the process in an update)
+
+On macOS, the new Teams (`com.microsoft.teams2`) may have a different process name than expected. The process might be "Microsoft Teams" or "Microsoft Teams (work or school)" or just "Teams" depending on version.
 
 **Why it happens:**
-File I/O is not atomic. Developers assume "write to file" is instant and reliable, but process crashes, disk full conditions, and OS buffering all create windows where state is inconsistent.
+Developers run `pgrep -x "Microsoft Teams"` on their machine, see a PID, and hardcode the name. They don't test with Teams Helper processes, Teams PWA instances, or after a Teams update that changes the process name.
 
-**How to avoid:**
-- Use atomic file writes: write to a temp file, then `os.rename()` (atomic on the same filesystem) to the state file path. This prevents corruption.
-- Accept the "at-least-once" delivery semantic: it's better to re-send a duplicate notification on restart than to lose one. Persist the rec_id AFTER successful webhook delivery, accepting that a crash in between means a duplicate.
-- Track the highest `rec_id` rather than a set (simpler, and sufficient if rec_ids are monotonically increasing in the notification DB -- verify this assumption).
-- If rec_ids are not monotonic, track a set of processed rec_ids, but cap the set size (e.g., last 10,000) and use a high-water mark to avoid unbounded memory growth.
-- On startup, log the restored state (last rec_id or count of tracked IDs) so operators can verify correctness.
+**Consequences:**
+- Process check says "running" when Teams is actually closed (matched a helper process)
+- Process check says "not running" when Teams is open (process name changed)
+- Fallback chain produces wrong status
 
-**Warning signs:**
-- Duplicate webhook deliveries after daemon restart
-- State file contains truncated JSON / is empty after a crash
-- "Gap" notifications never processed because they had lower rec_ids than the high-water mark
-- State file grows unboundedly over time
+**Prevention:**
+- Use `pgrep -x` for exact matching. Test the exact process name on the target machine.
+- Make the process name configurable in config.json alongside bundle IDs.
+- Better: use `pgrep -f "Contents/MacOS/.*[Tt]eams"` to match the executable path, which is more stable than the display name.
+- Even better: instead of pgrep, check for a running process by bundle ID. On macOS, `osascript -e 'tell application "System Events" to (name of processes) contains "Microsoft Teams"'` works but requires Accessibility permission (which you may already have for AX status). If Accessibility is not available, fall back to pgrep.
+- When pgrep returns multiple PIDs, treat as "running" (any match is sufficient for "Teams is running").
 
-**Phase to address:**
-Phase 1 (Core DB Watcher) for basic persistence, refined in Phase 2 (Teams Filtering) when webhook delivery ordering matters. Atomic writes should be implemented from the start.
+**Detection:**
+- Process check reports "running" when Teams dock icon is absent
+- Process check reports "not running" when Teams is visibly open
+- pgrep output contains multiple PIDs (log and investigate which processes matched)
+
+**Phase to address:** First implementation plan -- decide the process detection strategy (pgrep vs. osascript check) and the exact match pattern before writing the code.
 
 ---
 
-### Pitfall 8: Full Disk Access (FDA) Permission Not Granted
+### Pitfall 8: Status Cache Stale After Sleep/Wake Cycle
 
 **What goes wrong:**
-macOS (Catalina and later) requires Full Disk Access (FDA) for processes that read files in `~/Library/Group Containers/` belonging to other apps. Without FDA, the Python process silently fails to open the notification database -- `sqlite3.connect()` may return an error, or worse, may succeed but return zero rows because the process doesn't have read access to the actual file content (sandboxing returns empty/permission-denied).
+The daemon caches status with a 30-60 second TTL. When the Mac goes to sleep (lid close, idle sleep), the daemon is suspended by the OS. On wake, the cache TTL appears still valid (wall clock jumped, but the cache timestamp was set before sleep). The cached status is stale -- user may have been Away for hours -- but the daemon uses the cached "Available" status and drops the first batch of notifications after wake.
 
-The failure mode is confusing: the daemon starts, appears to be running, but captures zero notifications. There is no obvious "permission denied" error because macOS sandbox violations are often silent.
+Similarly, HIDIdleTime resets on wake (user opened lid = physical input), so the idle signal says "active" even though Teams may still show Away until it syncs.
 
 **Why it happens:**
-macOS privacy protections are aggressive and not well-documented for programmatic access. Developers test in environments where they've already granted FDA (from prior experiments) and forget it's required. New users hit this on first run with no clear error.
+Developers test with the Mac always awake. Sleep/wake introduces time discontinuities that invalidate assumptions about cache freshness. `time.monotonic()` continues to advance during sleep on macOS (unlike some other platforms), so a cache check using monotonic time may or may not catch the gap depending on sleep duration vs. TTL.
 
-**How to avoid:**
-- On startup, attempt to open and read the database. If zero records are returned or an error occurs, check for FDA explicitly. Print a clear message: "Full Disk Access required. Go to System Settings > Privacy & Security > Full Disk Access and add Terminal (or your terminal emulator)."
-- Test the actual read: `SELECT COUNT(*) FROM record LIMIT 1` (or equivalent). If this returns an error or zero when the DB file exists and has nonzero size, it's likely a permission issue.
-- Document the FDA requirement prominently in the README, including step-by-step instructions with screenshots for System Settings.
-- Consider detecting the specific terminal app being used (`$TERM_PROGRAM`) and including it in the instruction message.
+**Prevention:**
+- Use `time.monotonic()` for cache timing, not `time.time()`. On macOS, `time.monotonic()` is based on `mach_absolute_time()` which does NOT advance during sleep. This means the cache TTL "pauses" during sleep and naturally expires relative to actual processing time.
+- BUT: verify this behavior on your macOS version. The Python docs say monotonic clock "may or may not include time during sleep" and this varies by platform. If it does include sleep time on your macOS version, the cache will appear fresh after sleep when it should be stale.
+- Add an explicit invalidation: after any kqueue timeout where no events were received AND more than N minutes of wall-clock time passed, invalidate the status cache. This catches the "woke from sleep, lots of time passed" case.
+- On the first poll cycle after a long gap (>2x poll interval), always refresh status before processing.
 
-**Warning signs:**
-- Daemon starts without errors but captures zero notifications
-- `sqlite3.OperationalError: unable to open database file` on first run
-- Database file exists (visible in Finder) but Python reports it as empty or unreadable
-- Works in one terminal but not another (FDA is per-app, so Terminal.app may have it but iTerm2 may not)
+**Detection:**
+- First notification after wake is incorrectly gated
+- Logs show cache hit immediately after a long gap between poll cycles
 
-**Phase to address:**
-Phase 1 (Core DB Watcher) -- the very first thing the startup sequence should verify. This should block the daemon from running if FDA is not detected, rather than silently producing no results.
+**Phase to address:** Second implementation plan -- sleep/wake handling is a hardening concern, not a first-pass requirement. But the cache timing choice (monotonic vs wall clock) should be correct from the start.
 
 ---
 
-### Pitfall 9: Notification Cleanup / Purge Causes Negative rec_id Delta
+### Pitfall 9: AppleScript `entire contents` Is Extremely Slow on Complex Windows
 
 **What goes wrong:**
-macOS periodically purges old notifications from the database. `usernoted` may also vacuum or recreate the database. If the daemon's persisted "last rec_id" is higher than the maximum rec_id in the (now-purged) database, the daemon's query `WHERE rec_id > last_processed_rec_id` returns zero rows forever. The daemon appears to be running but captures nothing.
-
-In extreme cases, after a DB recreation, rec_ids restart from 1. The daemon's persisted state says "I've processed up to rec_id 50000" and every new notification (rec_id 1, 2, 3...) is below the threshold and ignored.
+The natural approach to finding status text in Teams' AX tree is to dump `entire contents` of the window and search for a status string. This is catastrophically slow. `entire contents` traverses the ENTIRE UI element hierarchy, which for a complex Electron/web-based app like Teams can be thousands of elements. This takes 5-30 seconds, during which the event loop is blocked (see Pitfall 1).
 
 **Why it happens:**
-Developers test with a fresh database where rec_ids only increase. They don't test the scenario where the database is purged, vacuumed, or recreated by macOS, which resets the rec_id sequence.
+Developers use `entire contents` as a convenient debugging tool in Script Editor to explore the UI hierarchy. It works (slowly) for exploration, but is unsuitable for repeated automated queries. The performance problem is architectural: each UI element access requires a round-trip Apple Event between the scripting host and the target application, and `entire contents` generates hundreds or thousands of these round-trips.
 
-**How to avoid:**
-- On startup and periodically during operation, check `SELECT MAX(rec_id) FROM record`. If `MAX(rec_id) < last_processed_rec_id`, the database has been purged/recreated. Reset the high-water mark to 0 and log a warning.
-- Alternatively, query `SELECT COUNT(*) FROM record WHERE rec_id > last_processed_rec_id`. If this is 0 but `SELECT COUNT(*) FROM record` is nonzero, something is wrong -- investigate.
-- Store the database file's inode number or creation timestamp alongside the rec_id in the state file. If the inode changes, reset the state.
-- Log the current `MAX(rec_id)` on startup so operators can compare against the persisted state.
+**Prevention:**
+- NEVER use `entire contents` in the production AppleScript. Use a targeted path: `tell application "System Events" to tell process "Microsoft Teams" to get value of static text 1 of group 1 of ...` (path discovered via Accessibility Inspector).
+- Use Accessibility Inspector (in Xcode developer tools) to find the exact element path to the status text. Document this path and the Teams version it was discovered on.
+- If the exact path is fragile (breaks on Teams update), use a shallow search: iterate children of a specific known container, not the entire window.
+- The narrower the element targeting, the faster the call: targeting a specific group at a known depth is 10-100x faster than `entire contents`.
+- Profile the AppleScript: run it in Script Editor and check the time. If it takes >200ms, the path is too broad.
 
-**Warning signs:**
-- Daemon running with no webhook calls despite new notifications arriving in macOS UI
-- `MAX(rec_id)` in DB is lower than persisted `last_processed_rec_id`
-- After system restart or macOS update, daemon stops capturing
+**Detection:**
+- osascript calls consistently take >1 second (should be <200ms for a targeted query)
+- Event loop processing latency spikes when AX signal is used
 
-**Phase to address:**
-Phase 1 (Core DB Watcher) -- DB validity check must be part of the startup sequence and the periodic health check.
+**Phase to address:** Research phase (before implementation) -- use Accessibility Inspector to discover the element path BEFORE writing the AppleScript. The script design depends on the discovered path.
 
 ---
 
-### Pitfall 10: Teams Notification Format Variations Break Allowlist
+### Pitfall 10: Gating Logic Drops Notifications That Should Be Forwarded
 
 **What goes wrong:**
-The allowlist strategy ("only forward notifications with both a sender and body present") seems clean but has edge cases:
-1. **Group chat format**: Sender might be "Alice in GroupChatName" or the title might be the group name with the sender in the subtitle. The "sender" field contains different content depending on 1:1 vs group vs channel.
-2. **Channel notifications**: For Teams channels, the title may be "ChannelName" and subtitle "SenderName," or vice versa, depending on Teams version and notification settings.
-3. **Reactions that look like messages**: "Alice liked your message" has both a sender-like title and a body. The allowlist passes it through unless specifically filtered.
-4. **Meeting notifications**: "Meeting starting in 5 minutes" or "Alice joined the meeting" have sender-like content but are not chat messages.
-5. **Empty-looking bodies**: Some notifications have a body that's just whitespace or a zero-width character. `.strip()` catches whitespace but not all Unicode whitespace variants.
+The core v1.1 behavior is: forward on Away/Busy, drop on Available/Offline/OOO. Edge cases:
+1. **Status is UNKNOWN** (all signals failed): Drop or forward? Dropping means silent data loss. Forwarding means noise when the user is Available.
+2. **Status is "Do not disturb"**: Is DND treated as Busy (forward) or as "user explicitly doesn't want interruptions" (drop)?
+3. **Status just changed**: User went Away 5 seconds ago, but the notification was generated 10 seconds ago (before the transition). The notification was for an Available user but is being processed against an Away status.
+4. **Teams is not running**: Should this be treated as "user is away from Teams" (forward) or "user is not using Teams" (drop)?
+5. **Multiple status values from different signals disagree** (covered in Pitfall 6, but the gating decision amplifies the impact).
 
 **Why it happens:**
-Teams notifications are not a stable, documented API. They are user-facing strings that vary by Teams version, locale, notification settings, and conversation type. An allowlist based on field presence is a heuristic, not a contract.
+Developers implement the happy path (Available = drop, Away = forward) and don't think through the edge cases. Each edge case is a policy decision, not a technical one, and different users want different behavior.
 
-**How to avoid:**
-- In addition to field presence, add content-based filters: reject notifications where the title is exactly "Microsoft Teams" (system notifications), where the body matches known non-message patterns (reactions, calls, meetings)
-- Build a blocklist of known non-message patterns alongside the allowlist: `["liked your message", "joined the meeting", "is calling", "left the meeting", "scheduled a meeting"]`
-- Make both allowlist and blocklist configurable so users can tune without code changes
-- Log all rejected notifications at DEBUG level so users can audit what's being filtered out
-- Accept that some noise will get through and some messages will be missed. Perfect filtering is not achievable. Design downstream consumers to handle occasional noise.
+**Prevention:**
+- Define explicit policy for EVERY status value, including UNKNOWN:
+  ```
+  Available    -> DROP
+  Away         -> FORWARD
+  Busy         -> FORWARD
+  DND          -> FORWARD (user may still want mobile alert)
+  BRB          -> FORWARD
+  Offline      -> DROP (Teams not connected)
+  OOO          -> DROP
+  UNKNOWN      -> FORWARD (fail-open: better to get noise than miss messages)
+  ```
+- Make the gating policy configurable: `"forward_statuses": ["Away", "Busy", "DND", "BRB", "Unknown"]` in config.json. This lets users tune without code changes.
+- Log every gating decision: `"Notification from Alice | status=Available (source=ax) | DROPPED"`. This is essential for debugging and user confidence.
+- Default to fail-open (forward on UNKNOWN). The v1.0 behavior was "forward everything." The v1.1 addition should only SUBTRACT (drop when clearly Available), never accidentally drop when uncertain.
 
-**Warning signs:**
-- Webhook receives reaction/call/meeting notifications that should have been filtered
-- Legitimate messages from group chats are filtered out because the title format doesn't match expectations
-- After a Teams update, filter starts passing through noise or blocking real messages
+**Detection:**
+- Users report missing notifications (dropped due to wrong status)
+- Logs show UNKNOWN status for extended periods with no explanation
+- DND notifications are dropped when user expected them forwarded
 
-**Phase to address:**
-Phase 2 (Teams Filtering) -- this is the core of that phase. Build the filter as a configurable pipeline, not hardcoded conditionals. Include logging for all filter decisions.
+**Phase to address:** First implementation plan -- the gating policy must be defined and documented before the code is written. This is a requirements decision, not a coding decision.
 
 ---
 
-## Technical Debt Patterns
+## Minor Pitfalls
 
-Shortcuts that seem reasonable but create long-term problems.
+Mistakes that cause minor issues, confusing logs, or operational annoyance.
 
-| Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
-|----------|-------------------|----------------|-----------------|
-| Hardcoding the DB path | Faster initial development | Breaks on any macOS version change | Never -- use detection logic from day one |
-| In-memory rec_id tracking only | No file I/O complexity | All state lost on restart, reprocesses entire DB | Only during initial development/testing, never in "production" |
-| Single bundle ID filter | Simpler filter logic | Misses notifications from other Teams versions | Never -- use a configurable set |
-| Polling-only (no kqueue) | Simpler, no FD management | Higher latency (seconds vs milliseconds), wastes CPU | Acceptable as fallback, not as primary mechanism |
-| Shell-exec for webhook (curl) | Quick prototype | Process spawn overhead per notification, error handling is harder, shell injection risk | Only in prototype, replace with `requests`/`urllib` in Phase 1 |
-| Printing to stdout instead of logging | No logging setup needed | No log levels, no file rotation, no structured output | Only during initial debugging |
-| No startup validation | Faster to "just start" | Silent failures (wrong path, no FDA, wrong schema) | Never -- startup checks prevent hours of debugging |
+### Pitfall 11: Status Check Spawns Too Many Processes
 
-## Integration Gotchas
+**What goes wrong:**
+Without caching, every notification triggers up to 3 subprocess calls (osascript, ioreg, pgrep). During a burst of 20 notifications, that is 60 process spawns in seconds. Each `subprocess.run()` call forks the Python process, exec's the command, waits for completion, and cleans up. This is expensive: each fork copies the process's memory page table, and on macOS, process creation is slower than on Linux.
 
-Common mistakes when connecting to external services.
+**Prevention:**
+- Cache status with a 30-60 second TTL. Status doesn't change faster than this.
+- Check status once per poll cycle, not per notification. The entire batch shares one status.
+- The fallback chain should short-circuit: if AX returns a result, don't also run ioreg and pgrep.
 
-| Integration | Common Mistake | Correct Approach |
-|-------------|----------------|------------------|
-| Webhook HTTP POST | No timeout on the POST request, daemon hangs if endpoint is slow | Set a 5-10 second timeout on `requests.post()`. On timeout, log and skip (per project design). |
-| Webhook HTTP POST | Not checking HTTP status code, assuming 2xx | Check `response.status_code`. Log non-2xx responses with the status code and response body. |
-| Webhook HTTP POST | Sending notification data as form-encoded instead of JSON | Use `requests.post(url, json=payload)` not `requests.post(url, data=payload)` |
-| SQLite connection | Keeping connection open permanently | Open, query, close per cycle. Or at minimum, use short-lived transactions. Long-lived connections to another process's DB are fragile. |
-| SQLite connection | Not handling `OperationalError` for locked/busy states | Wrap all queries in try/except, handle gracefully |
-| macOS file system | Assuming `~` expands in all contexts | Use `os.path.expanduser("~")` or `pathlib.Path.home()` explicitly |
-| Config file | Not validating config on load (missing keys, wrong types) | Validate all required keys on startup, fail with clear error messages |
+---
 
-## Performance Traps
+### Pitfall 12: ioreg Output Changes Between macOS Versions
 
-Patterns that work at small scale but fail as usage grows.
+**What goes wrong:**
+The ioreg output format (key names, nesting, quoting) has been stable for years, but Apple does not guarantee it. Future macOS versions could rename `HIDIdleTime`, change the IOHIDSystem hierarchy, or alter the output formatting. The regex-based parser would silently fail.
 
-| Trap | Symptoms | Prevention | When It Breaks |
-|------|----------|------------|----------------|
-| Querying all records on every poll instead of using rec_id cursor | Slow queries, high CPU as DB grows | Always use `WHERE rec_id > last_id` with an index on rec_id | DB exceeds ~10K records |
-| Storing all processed rec_ids in a Python set (unbounded) | Memory grows continuously | Use high-water mark or capped deque, not unbounded set | After weeks/months of operation (100K+ IDs) |
-| Spawning subprocess (curl/script) per notification | High latency per notification, process creation overhead | Use in-process HTTP client (requests/urllib) | During notification bursts (10+ in seconds) |
-| Synchronous webhook delivery blocking the poll loop | New notifications queue up while waiting for slow webhook | Fire-and-forget with timeout, or async delivery | When webhook endpoint is slow (>1s response time) |
-| Reading entire DB file to detect changes instead of kqueue/polling | Massive I/O, wastes disk bandwidth | Use kqueue on WAL + fallback timer | Always -- DB can be 10-100MB |
+**Prevention:**
+- If the regex returns None, log a WARNING with the raw ioreg output (first 500 chars) so you can diagnose the format change.
+- Include the macOS version in startup logs so format failures can be correlated with OS updates.
+- Consider `ioreg -a` (plist output format) which produces machine-parseable XML plist. This is more robust than parsing the human-readable text format: `ioreg -c IOHIDSystem -a` then parse with `plistlib.loads()`.
 
-## Security Mistakes
+---
 
-Domain-specific security issues beyond general web security.
+### Pitfall 13: Status Metadata Bloats Webhook Payload When Status Is Unavailable
 
-| Mistake | Risk | Prevention |
-|---------|------|------------|
-| Logging full notification content at INFO level | PII (message content, sender names) written to log files accessible to other processes | Log full content at DEBUG only. Default logging to WARNING+. |
-| Webhook URL in plaintext config file with world-readable permissions | Anyone on the machine can read the webhook URL and send spoofed data | Set file permissions to 0600 on config file. Document this in setup. |
-| No TLS verification on webhook POST | MITM can intercept notification content | Use `verify=True` (default in requests). Do not add `verify=False` to "fix" cert errors. |
-| Shell injection via notification content | If using subprocess/shell for webhook delivery, notification body could contain shell metacharacters | Never pass notification content through shell. Use in-process HTTP or proper argument escaping. |
-| State file in world-readable location | Reveals what notifications have been processed (metadata leak) | State file permissions 0600, same as config. |
-| Not sanitizing notification content before JSON serialization | Control characters in notification body can break JSON consumers | Use `json.dumps()` which handles escaping, but also strip null bytes and other control chars |
+**What goes wrong:**
+The webhook payload adds `detected_status`, `status_source`, and `status_confidence` fields. When all signals fail, these fields are `"Unknown"`, `"none"`, `"zero"` respectively -- present but not useful. Downstream consumers that parse these fields may misinterpret "Unknown" as a meaningful status rather than "we couldn't determine status."
 
-## UX Pitfalls
+**Prevention:**
+- Use `null` (JSON null) for `detected_status` when status cannot be determined, not a string "Unknown". This lets downstream code distinguish "checked and found Unknown" from "could not check."
+- Or: include a `status_available: true/false` boolean alongside the status fields.
+- Document the webhook payload schema including all possible values for the status fields.
 
-Common user experience mistakes in this domain.
+---
 
-| Pitfall | User Impact | Better Approach |
-|---------|-------------|-----------------|
-| No indication of what's being filtered out | User thinks messages are missing but they were just filtered | Log filter decisions at DEBUG; provide a `--verbose` flag that shows all notifications including filtered ones |
-| Daemon starts silently with no confirmation | User doesn't know if it's working until the first notification arrives (could be minutes/hours) | Print startup summary: DB path, FDA status, bundle IDs watched, webhook URL, last processed rec_id |
-| No health check mechanism | User has no way to verify the daemon is still alive and working | Add a periodic heartbeat log message ("Still watching, N notifications processed in last hour") |
-| Cryptic error on FDA failure | User sees "unable to open database" and doesn't know what to do | Detect the specific failure and print actionable instructions for granting FDA |
-| Webhook failures logged but not escalated | Operator doesn't notice the webhook has been failing for hours | After N consecutive webhook failures, print a WARNING-level message indicating persistent delivery issues |
+## Phase-Specific Warnings
 
-## "Looks Done But Isn't" Checklist
+| Phase Topic | Likely Pitfall | Mitigation |
+|-------------|---------------|------------|
+| AppleScript AX tree walk | osascript hangs permanently (Pitfall 2) | Always use `timeout=5` on subprocess.run() |
+| AppleScript AX tree walk | `entire contents` takes 5-30 seconds (Pitfall 9) | Use targeted element path, not tree dump |
+| AppleScript AX tree walk | Permission granted to wrong app (Pitfall 3) | Probe at startup, print instructions with detected terminal name |
+| AppleScript AX tree walk | New Teams has broken AX tree (Pitfall 4) | Validate result against known status strings, design for AX being unavailable |
+| ioreg HIDIdleTime | Nanosecond/second confusion (Pitfall 5) | Always divide by 1_000_000_000, comment the conversion |
+| ioreg HIDIdleTime | Output format changes (Pitfall 12) | Use robust regex, handle None, consider plist output mode |
+| pgrep process check | Matches wrong process (Pitfall 7) | Use `-x` for exact match, make process name configurable |
+| Subprocess from event loop | Blocks kqueue loop (Pitfall 1) | Cache status with TTL, check once per cycle not per notification |
+| Fallback chain | Signals disagree during transitions (Pitfall 6) | Use one signal chain (not hybrid), add hysteresis |
+| Gating logic | Drops notifications on UNKNOWN status (Pitfall 10) | Fail-open policy, configurable forward_statuses |
+| Sleep/wake | Stale cache after wake (Pitfall 8) | Use monotonic time for cache, invalidate on long gaps |
+| Status caching | Too many subprocesses without cache (Pitfall 11) | 30-60s TTL, check once per cycle |
 
-Things that appear complete but are missing critical pieces.
+## Subprocess Integration Gotchas (macOS-specific)
 
-- [ ] **DB watching:** Works in testing but no fallback poll timer -- will miss notifications during WAL checkpoints. Verify kqueue AND timer-based polling both trigger notification processing.
-- [ ] **Plist parsing:** Parses 1:1 chat notifications but crashes on group/channel/call notifications with different plist structures. Test with at least 5 different notification types.
-- [ ] **Startup:** Connects to DB successfully but doesn't verify FDA -- works on dev machine but fails silently on fresh installs. Add explicit FDA check.
-- [ ] **State persistence:** Saves rec_id to file but doesn't use atomic writes -- state file will corrupt on crash. Verify with kill -9 during operation.
-- [ ] **Filtering:** Allowlist passes all "real" messages but also passes reactions and meeting joins that have sender+body. Test with non-message notification types.
-- [ ] **Webhook delivery:** POSTs successfully but has no timeout -- will hang forever if endpoint goes down. Verify behavior with a non-responsive endpoint.
-- [ ] **Bundle ID filtering:** Matches `com.microsoft.teams2` but not `com.microsoft.teams` -- misses classic Teams users. Verify with both bundle IDs.
-- [ ] **Config loading:** Reads config file but doesn't validate values -- empty webhook URL or missing keys cause cryptic errors later. Add validation on load.
-- [ ] **rec_id tracking:** Tracks highest rec_id but doesn't handle DB purge/recreation -- daemon stops capturing after macOS cleans the DB. Test with a reset DB.
-- [ ] **Error handling:** Happy path works but unhandled exception in notification processing kills the main loop. Wrap the per-notification processing in try/except.
+Common mistakes when calling external commands from a Python daemon on macOS.
+
+| Gotcha | What Happens | Correct Approach |
+|--------|-------------|------------------|
+| No `timeout=` on subprocess.run() | Process hangs forever if child doesn't exit | Always specify `timeout=5` (or appropriate value) |
+| Using `shell=True` with osascript | Shell injection risk if any input is interpolated; also slower (extra shell process) | Use `shell=False` with list args: `["osascript", "-e", script]` |
+| Not capturing stderr | Accessibility errors appear on stderr; returncode 1 alone doesn't explain why | Use `capture_output=True` and check `result.stderr` for "not allowed assistive access" |
+| Ignoring returncode | osascript returns 1 on error but stdout may still contain partial output | Check `result.returncode == 0` before using stdout |
+| Not handling TimeoutExpired | The exception propagates up and crashes the event loop | Catch `subprocess.TimeoutExpired` and return None / fallback |
+| Calling subprocess in signal handler | Signal handlers in Python are restricted; subprocess calls may deadlock | Never call subprocess from a signal handler. The daemon already uses the flag-setting pattern (correct). |
+| Not stripping subprocess stdout | Output includes trailing newline; comparison with "Available" fails because it is "Available\n" | Always `.strip()` the stdout before comparing |
+| ioreg output parsed with wrong regex | Multiple HIDIdleTime entries; regex grabs wrong one | Use `re.search()` (first match) or filter with `-d` depth flag |
+
+## AX Permission Handling Patterns
+
+The correct pattern for detecting and communicating Accessibility permission status.
+
+```
+Startup:
+  1. Run minimal AX probe: osascript -e 'tell application "System Events" to get name of first process'
+  2. If returncode == 0: AX is available. Log "AX status signal: AVAILABLE"
+  3. If returncode == 1 AND stderr contains "assistive access":
+     a. Detect terminal: os.environ.get("TERM_PROGRAM")
+     b. Log WARNING with instructions: "Accessibility permission required for status detection.
+        Grant access to [terminal name] in System Settings > Privacy & Security > Accessibility."
+     c. Log "AX status signal: UNAVAILABLE (missing permission)"
+     d. Continue running with degraded status (idle+process only)
+  4. If returncode == 1 AND stderr contains other error:
+     a. Log WARNING: "AX probe failed: [stderr content]"
+     b. Log "AX status signal: UNAVAILABLE (probe error)"
+     c. Continue running with degraded status
+
+Runtime:
+  5. AX calls that fail should NOT retry immediately -- use a backoff
+  6. After N consecutive AX failures, disable AX signal for the session and log WARNING
+  7. Periodically re-enable AX probe (every 5 minutes) in case permission was granted while running
+```
+
+## "Looks Done But Isn't" Checklist (v1.1)
+
+Things that appear complete but are missing critical pieces for the status detection feature.
+
+- [ ] **osascript call works:** But no `timeout=` parameter -- will hang when Teams is unresponsive. Verify with `kill -STOP` on Teams process.
+- [ ] **AX returns status text:** But doesn't validate against known status set -- garbage text from broken AX tree treated as valid status.
+- [ ] **ioreg parsing works:** But uses nanoseconds directly without dividing by 10^9 -- idle time appears as billions of seconds.
+- [ ] **Fallback chain works:** But checks all three signals every time -- no caching, no short-circuit. 3 subprocess calls per notification during bursts.
+- [ ] **Gating drops Available notifications:** But doesn't handle UNKNOWN status -- all notifications dropped when AX times out and ioreg fails.
+- [ ] **Status in webhook payload:** But uses string "Unknown" instead of null -- downstream can't distinguish "checked, unknown" from "couldn't check."
+- [ ] **pgrep checks for Teams:** But uses substring match -- also matches "Microsoft Teams Helper" and "Microsoft Teams (work preview)."
+- [ ] **Cache implemented:** But uses `time.time()` instead of `time.monotonic()` -- cache validity affected by clock adjustments and sleep/wake.
+- [ ] **Accessibility probe at startup:** But only checks for System Events access, not specifically for Teams window access -- probe passes but Teams-specific AX fails.
+- [ ] **Status detection integrated:** But status is checked AFTER notification processing begins -- if status is Available, work was done to parse/filter the notification before it gets dropped. Check status FIRST, skip the batch if dropping.
 
 ## Recovery Strategies
 
-When pitfalls occur despite prevention, how to recover.
-
 | Pitfall | Recovery Cost | Recovery Steps |
 |---------|---------------|----------------|
-| Database locking / corruption | LOW | Restart daemon. If DB is corrupted, restart usernoted (`killall usernoted`; macOS will restart it and recreate the DB). |
-| Stale kqueue FD | LOW | Restart daemon. The kqueue watch will be re-established on the current WAL file. Consider adding auto-detection and re-registration. |
-| Wrong DB path | LOW | Update path detection logic. Check actual path with `ls ~/Library/Group\ Containers/group.com.apple.usernoted/db2/`. |
-| FDA not granted | LOW | Grant FDA in System Settings. Restart daemon. No data loss (missed notifications are gone, but future ones will be captured). |
-| State file corruption | LOW | Delete state file. Daemon will reprocess existing notifications in DB (duplicates to webhook, but no data loss). |
-| rec_id high-water mark above DB max | LOW | Delete or edit state file to reset rec_id to 0. Daemon will reprocess existing notifications. |
-| Plist parsing failure on new macOS version | MEDIUM | Dump raw plist data from DB, examine new structure, update parsing logic. May require reverse-engineering the new format. |
-| Bundle ID change after Teams update | LOW | Check DB for new bundle IDs, add to config. `SELECT DISTINCT app_id FROM record WHERE app_id LIKE '%teams%'`. |
-| Webhook endpoint down | LOW | Fix endpoint. Missed notifications are lost (log-and-skip design). Check logs for what was missed. No way to replay. |
-| Teams notification format change | MEDIUM | Dump recent notifications, compare against filter rules, update allowlist/blocklist patterns. |
-
-## Pitfall-to-Phase Mapping
-
-How roadmap phases should address these pitfalls.
-
-| Pitfall | Prevention Phase | Verification |
-|---------|------------------|--------------|
-| SQLite DB locking | Phase 1: Core DB Watcher | Test with concurrent writes; verify no `SQLITE_BUSY` crashes |
-| kqueue WAL unreliability | Phase 1: Core DB Watcher | Verify notifications captured during WAL checkpoint; test with burst of 10+ simultaneous notifications |
-| Sequoia DB path divergence | Phase 1: Core DB Watcher | Startup prints detected path; test on Sequoia specifically |
-| Binary plist parsing fragility | Phase 1: Core DB Watcher | Parse 5+ different notification types without error |
-| Teams bundle ID fragmentation | Phase 2: Teams Filtering | Test with both `com.microsoft.teams` and `com.microsoft.teams2` |
-| Foreground suppression gaps | Phase 3: Webhook/JSON | Document in webhook payload; mention in README |
-| rec_id state persistence races | Phase 1: Core DB Watcher | Kill -9 during operation, verify restart behavior |
-| FDA permission failure | Phase 1: Core DB Watcher | Test on fresh macOS user account without FDA pre-granted |
-| DB purge / rec_id reset | Phase 1: Core DB Watcher | Simulate by deleting and recreating DB file |
-| Teams format variations | Phase 2: Teams Filtering | Test with group chats, channels, reactions, calls, meetings |
+| osascript hangs (no timeout) | LOW | Kill daemon, add `timeout=5` to subprocess.run(), restart |
+| Accessibility permission missing | LOW | Grant permission in System Settings, restart daemon (or wait for periodic re-probe) |
+| AX tree broken after Teams update | MEDIUM | Re-inspect tree with Accessibility Inspector, update AppleScript path, redeploy |
+| ioreg format changed after macOS update | LOW | Capture new ioreg output, update regex, redeploy |
+| Status cache stale after sleep | LOW | Status auto-refreshes on next cache miss; may incorrectly gate 1-2 notifications after wake |
+| pgrep matches wrong process | LOW | Update process name in config.json, restart daemon |
+| Gating drops notifications incorrectly | LOW-MEDIUM | Change `forward_statuses` in config.json; lost notifications cannot be replayed |
 
 ## Sources
 
-- macOS notification center database internals (training data, MEDIUM confidence -- Apple does not document this)
-- SQLite WAL mode documentation (HIGH confidence -- well-documented by SQLite project)
-- kqueue behavior with file replacement (HIGH confidence -- POSIX/BSD well-documented)
-- nchook project architecture (MEDIUM confidence -- based on project description in PROJECT.md; source code not reviewed in this session)
-- Teams notification format patterns (MEDIUM confidence -- based on general knowledge of Teams notification behavior; no live Sequoia DB inspection performed)
-- macOS Full Disk Access requirements (HIGH confidence -- well-documented Apple privacy feature)
-- Binary plist format (HIGH confidence -- `plistlib` is standard library, well-documented)
+- [Apple Developer Forums: HIDIdleTime not being reset under Screen Sharing](https://developer.apple.com/forums/thread/721530) - HIDIdleTime behavior on headless Macs, nanosecond format. **MEDIUM confidence** (specific to Catalina; Sequoia may differ).
+- [Microsoft Community Hub: Enable Accessibility Tree on macOS in new Teams](https://techcommunity.microsoft.com/discussions/teamsdeveloper/enable-accessibility-tree-on-macos-in-the-new-teams-work-or-school/4033014) - New Teams AX tree is broken, parent-child relationships inconsistent. **MEDIUM confidence** (community report, may be fixed in later updates).
+- [DSSW: Inactivity and Idle Time on OS X](https://www.dssw.co.uk/blog/2015-01-21-inactivity-and-idle-time/) - HIDIdleTime overview, nanosecond conversion, IOKit architecture. **HIGH confidence** (well-documented, stable API).
+- [MacScripter: entire contents is slow](https://www.macscripter.net/t/entire-contents-is-slow-make-it-faster/54743) - Performance issues with `entire contents`, alternatives for targeted element access. **HIGH confidence** (well-known AppleScript limitation).
+- [Apple Developer Docs: Automating the User Interface](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/AutomatetheUserInterface.html) - UI scripting requires Accessibility permission on the calling app. **HIGH confidence** (official Apple documentation).
+- [Scripting OS X: Avoiding AppleScript Security and Privacy Requests](https://scriptingosx.com/2020/09/avoiding-applescript-security-and-privacy-requests/) - Permission model for osascript, which app receives the grant. **HIGH confidence** (well-researched blog by macOS admin expert).
+- [Python docs: subprocess management](https://docs.python.org/3/library/subprocess.html) - subprocess.run() timeout behavior, TimeoutExpired exception, POSIX child process cleanup. **HIGH confidence** (official Python documentation).
+- [Python discuss: Sporadic hang in subprocess.run](https://discuss.python.org/t/sporadic-hang-in-subprocess-run/26213) - Known issue with subprocess timeout on POSIX (busy loop implementation). **MEDIUM confidence** (CPython-specific behavior).
+- [GitHub: alacritty/alacritty#7334](https://github.com/alacritty/alacritty/issues/7334) - Assistive access broken from non-standard terminals; Accessibility permission is per-parent-app. **HIGH confidence** (reproduced by multiple users).
+- [XS-Labs: Detecting idle time with I/O Kit](https://xs-labs.com/en/archives/articles/iokit-idle-time/) - IOKit IOHIDSystem architecture, HIDIdleTime internals. **MEDIUM confidence** (older article, but IOKit API is stable).
 
-**Confidence note:** The most uncertain areas are (1) exact Sequoia DB schema column names and plist key names, and (2) current Teams notification format variations. These should be verified by inspecting a live Sequoia notification database during Phase 1 implementation.
+**Confidence note:** The highest uncertainty is around the new Teams (com.microsoft.teams2) AX tree structure. Community reports suggest it is broken, but Microsoft may have fixed it in recent updates. This MUST be verified with Accessibility Inspector on the actual installed Teams version before writing the AppleScript. If the AX tree is non-functional, the entire AX signal should be deprioritized and the system designed primarily around idle+process detection.
 
 ---
-*Pitfalls research for: macOS notification interception via SQLite database watching (Teams-specific)*
+*Pitfalls research for: Status detection integration (v1.1 milestone)*
 *Researched: 2026-02-11*
+*Previous version: v1.0 pitfalls (shipped, addressed in Phases 1-3)*

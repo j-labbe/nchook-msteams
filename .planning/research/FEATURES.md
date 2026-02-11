@@ -1,126 +1,159 @@
-# Feature Landscape
+# Feature Landscape: Status-Aware Notification Gating
 
-**Domain:** macOS notification interception and webhook forwarding (Teams-specific)
+**Domain:** macOS status detection and context-aware notification filtering for Teams daemon
 **Researched:** 2026-02-11
-**Confidence:** MEDIUM (based on training data + detailed project context; no live verification available)
+**Confidence:** MEDIUM (verified ecosystem patterns; AX approach for new Teams requires runtime validation)
 
 ## Table Stakes
 
-Features users expect. Missing = product feels incomplete.
+Features users expect from a daemon that gates notifications based on user presence. Missing any of these = the status gating feels broken or untrustworthy.
 
 | Feature | Why Expected | Complexity | Notes |
 |---------|--------------|------------|-------|
-| **Teams bundle ID filtering** | The entire point is Teams-only notifications. Without filtering, downstream consumers drown in system noise (Slack, Mail, Calendar). Must match both `com.microsoft.teams2` (new Teams) and `com.microsoft.teams` (classic). | Low | Simple string match against the `app` column in the notification DB. |
-| **Sender + message extraction** | A webhook payload without structured sender/message fields is useless JSON. Downstream agents need to know WHO said WHAT. Map `title` -> sender, `body` -> message content. | Low | Direct column reads from the notification DB record table. |
-| **Chat/channel name extraction (subt)** | Without this, downstream can't distinguish "same sender in DM vs channel" -- a critical routing distinction. This is the `subt` (subtitle) field that nchook doesn't currently pass through. | Low-Med | Requires patching nchook to read the `subt` column and pass it as a 5th argument. The column exists in the DB; the gap is nchook's extraction logic. |
-| **Allowlist filtering (sender + body present)** | Teams generates many non-message notifications: reactions, call events, "X is typing", join/leave, system alerts from "Microsoft Teams" itself. Without allowlisting, webhook gets 30-50% noise. The allowlist pattern (require both sender name and body content) is the simplest reliable heuristic. | Low | Check that title is not empty, not "Microsoft Teams" literally, and body is not empty/null. |
-| **Webhook POST delivery** | The output mechanism. No webhook = no bridge. Must POST JSON to a configurable URL with appropriate Content-Type headers. | Low | Standard `urllib.request` or `requests` POST. No auth complexity since the user controls the webhook endpoint. |
-| **JSON config file** | Hardcoded webhook URLs and settings make the tool unusable for anyone but the author. Config file is the minimum for portability. | Low | Read a JSON file on startup for webhook URL, poll interval, paths. |
-| **State persistence (processed rec_ids)** | Without this, every restart replays ALL historical notifications. On a busy Teams account, that's hundreds of duplicate webhooks on each restart. This is the difference between "works" and "works reliably." | Med | Write processed `rec_id` values to a state file. On startup, load them and skip already-processed records. Must handle the file not existing yet (first run). |
-| **macOS Sequoia DB path support** | macOS Sequoia (15+) moved the notification center DB from the pre-Sequoia path to `~/Library/Group Containers/group.com.apple.usernoted/db2/db`. Without this, the tool simply does not work on the target OS. | Low | Path detection/selection. Original nchook only knows the old path. |
-| **Structured JSON payload** | The webhook body must be parseable JSON, not raw text. Downstream agents need machine-readable fields: `sender`, `channel`, `message`, `timestamp`, `app_bundle_id`. | Low | `json.dumps()` with a well-defined schema. |
-| **Timestamp extraction** | Messages without timestamps are unorderable. Downstream agents need to know WHEN a message arrived, both for display and for detecting staleness. | Low | The notification DB stores delivery timestamps. Pass through to the JSON payload. |
+| **System idle time detection** | The most basic presence signal. If the user has not touched keyboard/mouse in N minutes, they are "away." Every presence-aware tool (screensavers, Slack, Teams itself) uses HIDIdleTime as the ground truth. Without this, the daemon cannot determine basic presence. | Low | `ioreg -c IOHIDSystem` returns HIDIdleTime in nanoseconds. Divide by 1e9 for seconds. Single subprocess call, no dependencies. Well-documented, works on Sequoia. |
+| **Configurable idle threshold** | Different users have different idle definitions. A developer debugging might not touch the keyboard for 10 minutes but is still "present." A 300s (5 min) default is reasonable (matches Teams' own idle threshold) but MUST be configurable. | Low | Config field `idle_threshold_seconds` with default 300. Trivial to implement. |
+| **Process-level Teams detection** | The daemon must know if Teams is running at all. If Teams is not running, the user cannot see notifications in Teams, so ALL notifications should be forwarded regardless of idle state. This is the simplest, most reliable signal. | Low | `pgrep -x "Microsoft Teams"` for new Teams. Must also check for `com.microsoft.teams2` bundle. New Teams (2024+) changed process naming; needs runtime verification on target machine. |
+| **Status-aware gating logic** | The core value proposition: forward notifications only when the user is Away or Busy (cannot see them in Teams), suppress when Available (would see them directly). Without this logic, the daemon is just a webhook forwarder with no intelligence. | Med | Requires combining status signals into a decision. Map detected status to forward/suppress action. Must handle ambiguous states gracefully (default to forward -- better to get a duplicate than miss a message). |
+| **Fallback chain for status detection** | No single status detection method is 100% reliable on macOS. AX access may be denied, HIDIdleTime has known edge cases (Karabiner-Elements causes keyboard-only idle to not reset), process checks tell you nothing about actual status. A fallback chain (AX text -> idle time -> process check) provides resilience. | Med | Three detection methods tried in priority order. If higher-priority method fails or is unavailable, fall through to next. Each method returns a status + confidence level. |
+| **Status metadata in webhook payload** | Downstream consumers need to know WHY a notification was forwarded. Was the user detected as Away via AX reading, or was it inferred from idle time? This transparency lets downstream systems apply their own logic (e.g., treat AX-detected Away differently than idle-inferred Away). | Low | Add `detected_status`, `status_source`, and `status_confidence` fields to existing webhook JSON payload. Minimal code change -- extend `build_webhook_payload()`. |
+| **Graceful degradation without Accessibility permission** | Accessibility access requires explicit user grant in System Settings. Many users will not grant it, or corporate MDM may block it. The daemon MUST work without AX access, falling back to idle + process detection. Crashing or refusing to start without AX access is a dealbreaker. | Med | On AX failure, log a warning with instructions (not an error), set AX as unavailable, continue with remaining signals. Re-check AX availability periodically (user might grant it later). |
+| **"Always forward" escape hatch** | Users must be able to disable status gating entirely and revert to v1.0 behavior (forward everything). This is critical for debugging, for users who find the gating too aggressive, and as a safety net if status detection breaks. | Low | Config field `status_gating_enabled` (default: true). When false, skip all status checks and forward everything. Existing filter pipeline remains unchanged. |
 
 ## Differentiators
 
-Features that set product apart. Not expected in a minimal tool, but add significant value.
+Features that go beyond minimum expectations. Not required for the gating to "work" but significantly improve trust and usability.
 
 | Feature | Value Proposition | Complexity | Notes |
 |---------|-------------------|------------|-------|
-| **Truncation detection flag** | macOS notification previews are truncated at ~150 characters. Flagging `"truncated": true` in the JSON payload lets downstream agents know the message is incomplete and should be treated differently (e.g., prompt the user to check Teams directly). This is unique to the DB-interception approach and most tools ignore it. | Low | Heuristic: if body length is >= ~140-150 chars and doesn't end with sentence-ending punctuation, flag as likely truncated. Not perfect, but useful signal. |
-| **Deduplication beyond rec_id** | The notification DB can occasionally surface the same logical notification with different `rec_id` values (e.g., after a DB compaction or Teams re-posting). Content-hash-based dedup (hash of sender+channel+body+timestamp) catches these edge cases. | Med | Maintain a secondary dedup cache alongside rec_id tracking. Adds state complexity. Consider as a v2 feature if duplicates become a real problem. |
-| **Notification type classification** | Beyond allowlist filtering, classify notifications into types: `direct_message`, `channel_message`, `mention`, `reply`. This requires pattern matching on the `subt` field format (DMs have no channel prefix, mentions include "@You" patterns, replies include "replied to" patterns). | Med | Pattern matching against known Teams notification text formats. Fragile to Teams UI string changes but high-value for downstream routing. |
-| **Health/heartbeat endpoint or signal** | Downstream systems need to distinguish "no Teams messages in the last hour" from "the interceptor crashed." A periodic heartbeat (even just writing a timestamp to a file or POSTing a heartbeat JSON) solves this. | Low | Periodic POST with `"type": "heartbeat"` or a local file touch. Simple but solves a real operational concern. |
-| **Graceful shutdown with state flush** | On SIGINT/SIGTERM, flush current state to disk before exiting. Prevents the "processed 50 notifications but state file only has 45" gap that causes duplicates on restart. | Low | Signal handler that writes state and exits cleanly. |
-| **Config reload without restart** | SIGHUP-triggered config reload lets you change the webhook URL or add filters without restarting (and without losing in-memory state). | Low-Med | Signal handler that re-reads config. Must be careful about partial state. |
-| **Dry-run / verbose mode** | Print what WOULD be sent without actually POSTing. Essential for debugging filters and verifying the tool sees the right notifications during setup. | Low | CLI flag that logs payloads to stdout instead of (or in addition to) POSTing. |
-| **Startup replay window** | On startup, optionally re-process notifications from the last N minutes (instead of only tracking new ones). Useful if the tool was down briefly and you don't want to miss messages from the gap. Bounded by a configurable time window to avoid replaying the entire history. | Med | Query notifications with delivery_date > (now - replay_window), excluding already-processed rec_ids. |
+| **Teams AX status text reading** | The only way to get the ACTUAL Teams status (Available, Away, Busy, DND, Be Right Back, Offline) without Microsoft Graph API. Reading the status text from Teams' UI via Accessibility API gives ground truth rather than inference. This is the primary differentiator over simple idle detection. | High | New Teams (2024+) moved from Electron to WebView2/React. The old AX tree exposure method no longer works. The new Teams menu bar extension (rolled out Oct-Nov 2024) shows presence status as an icon -- this is a potential AX target. Must use Accessibility Inspector to map the actual AX element hierarchy on the target machine. Requires `osascript` calling AppleScript with System Events. MEDIUM confidence this works -- needs runtime validation. |
+| **Teams menu bar icon status reading** | The Teams menu bar extension (GA since Nov 2024) displays a persistent presence indicator. If this menu bar extra exposes an AX `description` attribute containing status text, it provides a lightweight, always-available status reading without needing to inspect the main Teams window. | Med-High | Menu bar extras are accessible via `tell application "System Events" to get description of menu bar items of menu bar 1 of process "Microsoft Teams"`. Whether the Teams menu bar extra actually exposes useful description text (vs. generic "menu extra") is UNVERIFIED and needs runtime testing. LOW confidence until validated. |
+| **Screen lock / session state detection** | If the screen is locked, the user is definitively away. This is a stronger signal than idle time (user might be idle but looking at the screen). macOS provides `CGSessionCopyCurrentDictionary` which reports `CGSSessionScreenIsLocked`. | Med | Requires calling into Core Graphics framework. Python stdlib cannot do this natively. Options: (a) `osascript` to check if screen saver is running, (b) parse output of `ioreg` for screen state, (c) ctypes/objc bridge to call CG function. Option (a) is simplest but not perfectly reliable. |
+| **macOS Focus/DND mode detection** | If the user has Focus mode (Do Not Disturb) enabled, they have explicitly chosen to suppress notifications. This is a strong signal that forwarding is appropriate (notifications are being silenced, so the webhook ensures they still arrive somewhere). | Med | Can read from `~/Library/DoNotDisturb/DB/` using JXA/osascript or check `com.apple.controlcenter.plist` with `plutil`. The plist path has changed across macOS versions. Needs Sequoia-specific verification. |
+| **Status change event logging** | Log every status transition (Available -> Away, Away -> Available) with timestamp. Useful for debugging, for understanding the daemon's decision-making, and for downstream consumers who want a status history. | Low | Log at INFO level on each status change. Include old status, new status, detection source, and timestamp. Trivial to implement. |
+| **Status check caching / rate limiting** | AX queries and subprocess calls (ioreg, pgrep) have non-trivial overhead if run on every poll cycle (every 5 seconds). Caching the last status for a configurable TTL (e.g., 30 seconds) reduces overhead while maintaining responsiveness. | Low | Cache last status result with timestamp. If cache age < TTL, return cached value. Simple dict/timestamp check. |
+| **Hysteresis / debounce for status transitions** | Avoid rapid forward/suppress flipping when status oscillates (e.g., user briefly touches mouse during an "Away" period). Require a status to be stable for N seconds before acting on it. Prevents notification storm on brief activity. | Med | Track status stability duration. Only transition gating state after threshold (e.g., 30s stable). Adds state complexity but prevents a common annoyance. |
+| **Per-status gating rules** | Instead of binary "forward when Away/Busy, suppress otherwise," allow per-status configuration: `{"Available": "suppress", "Away": "forward", "Busy": "forward", "DND": "forward", "BeRightBack": "suppress", "Offline": "suppress"}`. Different users want different behavior. | Low | Config dict mapping status strings to actions. Straightforward lookup. Default rules cover the common case. |
 
 ## Anti-Features
 
-Features to deliberately NOT build. Each one has been considered and rejected for good reason.
+Features to deliberately NOT build for status detection. Each adds complexity that does not justify the value for this daemon.
 
 | Anti-Feature | Why Avoid | What to Do Instead |
 |--------------|-----------|-------------------|
-| **Microsoft Graph API integration** | The entire value proposition of this tool is avoiding Graph API complexity (OAuth flows, app registrations, tenant admin consent, token refresh, rate limits). Adding Graph API defeats the purpose. | Stick with DB interception. Accept the limitations (truncation, display names only) as acceptable tradeoffs. |
-| **Retry queue for failed webhooks** | Retry queues add state management complexity (persistent queue, backoff logic, dead letter handling, ordering guarantees). For a foreground process that logs failures, the operator can see failures and the next notification will succeed if the webhook is back up. | Log failures with full context (payload, HTTP status, error). Let the operator monitor logs. If reliability becomes critical, that's a signal to use a proper message queue system, not to bolt one onto this tool. |
-| **Reply / response capabilities** | Writing back to Teams requires Graph API or Accessibility API -- both are explicitly out of scope. Adding write capability changes the security posture entirely (read-only interception vs. impersonation risk). | Stay read-only. Downstream agents that need to reply should use their own Graph API integration. |
-| **GUI / menu bar app** | GUI adds an entire dependency surface (PyObjC, Cocoa bindings, or Electron) for a tool that should be a quiet background process. The target user is a developer running it in a terminal. | CLI with good logging. If GUI is ever needed, build it as a separate process that reads the same state file. |
-| **launchd service management** | Bundling launchd plist generation/installation adds OS integration complexity and makes debugging harder (launchd log redirection, restart policies, user vs. system agent). The tool should work first as a manual foreground process. | Document how to create a launchd plist manually if users want it. Keep the tool itself launchd-agnostic. |
-| **Accessibility API usage** | The Accessibility API approach (hooking into notification center UI) is fragile across macOS versions, requires elevated permissions (Screen Recording or Accessibility), and is slower than DB polling. | DB watching via kqueue on the WAL file is more reliable and lower-privilege. |
-| **AI/ML message classification** | Embedding AI logic (sentiment analysis, priority scoring, intent detection) couples the interception layer to a specific downstream use case. Different consumers want different classification. | Forward raw structured data. Let downstream agents apply their own intelligence. The interceptor's job is reliable capture, not interpretation. |
-| **Edit/delete detection** | macOS notifications don't surface message edits or deletions. The notification DB only contains the original delivery. Attempting to detect edits would require polling Teams directly (Graph API) or screen scraping. | Document this limitation clearly. Downstream consumers should treat intercepted messages as point-in-time snapshots. |
-| **Multi-account support** | Supporting multiple macOS user sessions or multiple Teams accounts on one machine adds session detection complexity for minimal real-world benefit (most users have one Teams account per machine). | Target single-user, single-Teams-account. Document the limitation. |
-| **Webhook authentication (OAuth/HMAC)** | Adding outbound webhook auth (signing payloads, OAuth bearer tokens) is premature complexity. The webhook receiver is controlled by the same user/org. If auth is needed, the receiver can validate by IP or the user can put an auth proxy in front. | Support a simple static `Authorization` header in config if anything. Do not build an auth framework. |
+| **Microsoft Graph API for presence** | Graph API requires Azure AD app registration, OAuth2 token flow, tenant admin consent, token refresh logic, and network connectivity. This is the exact complexity the project exists to avoid. It also means the daemon needs outbound internet access to Microsoft's APIs, adding a failure mode. | Stick with local-only detection (AX, idle, process). Accept that local detection is inferential rather than authoritative. The webhook payload's `status_confidence` field lets downstream consumers account for uncertainty. |
+| **Teams log file parsing for status** | The new Teams client (2024+) no longer writes presence status to local log files. The old `~/Library/Application Support/Microsoft/Teams/logs.txt` approach is dead. Multiple community projects (TeamsStatusMacOS, ms-teams-status-log) have been archived or pivoted for this reason. | Do not invest time in log parsing. The log file approach is a dead end for new Teams. |
+| **powerd log parsing for call detection** | TeamsStatusMacOS uses `powerd` process logs to detect meeting/call status as a workaround for the log file loss. This is clever but fragile -- it only detects "in a call" vs "not in a call," not full presence status. It also depends on undocumented system log behavior that may change across macOS versions. | If call detection becomes important, consider it as a supplementary signal in the fallback chain. Do not build the entire status detection around it. |
+| **Screen recording / pixel scraping** | Reading the Teams status dot color by taking screenshots and analyzing pixels. Requires Screen Recording permission (even more intrusive than Accessibility), is fragile to UI changes, and is computationally expensive for a polling daemon. | Use AX text reading which is the intended programmatic access pattern. Fall back to behavioral inference (idle time) when AX is unavailable. |
+| **Continuous AX monitoring (observer pattern)** | Setting up an AX observer to watch for status changes in real-time (push model) instead of polling (pull model). Adds significant complexity (CFRunLoop integration, observer lifecycle management) for marginal latency improvement. | Poll-based status checking at the existing poll interval (5s) or a separate status check interval (30s) is adequate. The notification latency already includes the 5s poll cycle; adding another 30s for status is acceptable. |
+| **Network-based idle detection** | Monitoring network traffic to/from Teams to infer activity. Requires elevated permissions (packet capture or network extension), adds privacy concerns, and is unreliable (Teams sends background traffic even when idle). | Stick with HIDIdleTime which directly measures what matters: human input device activity. |
+| **Calendar integration for auto-status** | Reading the user's calendar to predict when they are in meetings and adjusting gating accordingly. Adds OAuth complexity (for Exchange/Google), requires new permissions, and duplicates functionality Teams already has (calendar-based status). | If the user's Teams status is "In a meeting" (set by Teams from their calendar), the AX reader will pick that up. No need to duplicate the calendar -> status logic. |
 
 ## Feature Dependencies
 
 ```
-macOS Sequoia DB path support --> All other features (nothing works without the right DB)
-Teams bundle ID filtering --> Allowlist filtering (filter by app first, then by content)
-Sender + message extraction --> Structured JSON payload (extraction feeds the payload)
-Chat/channel name extraction (subt) --> Structured JSON payload (subt is a payload field)
-Chat/channel name extraction (subt) --> Notification type classification (needs subt patterns)
-Timestamp extraction --> Structured JSON payload (timestamp is a payload field)
-Structured JSON payload --> Webhook POST delivery (payload is what gets POSTed)
-Allowlist filtering --> Webhook POST delivery (only allowlisted messages get POSTed)
-JSON config file --> Webhook POST delivery (webhook URL comes from config)
-JSON config file --> State persistence (state file path comes from config or convention)
-State persistence --> Startup replay window (replay uses state to avoid re-sending)
-Truncation detection --> Structured JSON payload (truncation flag is a payload field)
+[Existing] Notification filter pipeline --> Status-aware gating (gating wraps existing filters)
+[Existing] Webhook payload builder --> Status metadata fields (extends existing payload)
+[Existing] Config loader --> Status gating config (new fields in existing config.json)
+[Existing] Event loop --> Status check integration (check status before/during notification processing)
+
+System idle detection --> Fallback chain (idle is the middle-priority signal)
+Process-level Teams detection --> Fallback chain (process check is the lowest-priority signal)
+Teams AX status text reading --> Fallback chain (AX is the highest-priority signal)
+Fallback chain --> Status-aware gating logic (chain produces the status; gating acts on it)
+Status-aware gating logic --> Status metadata in webhook (gating decision feeds payload)
+Configurable idle threshold --> System idle detection (threshold parameterizes idle check)
+"Always forward" escape hatch --> Status-aware gating logic (escape hatch bypasses gating)
+Graceful degradation without AX --> Fallback chain (drives fall-through behavior)
 ```
 
 Dependency ordering (build in this order):
 
 ```
-1. DB path detection (Sequoia support)
-2. DB reading + notification extraction (sender, message, subt, timestamp)
-3. Bundle ID + allowlist filtering
-4. JSON config loading
-5. Structured JSON payload construction
-6. Webhook POST delivery
-7. State persistence (rec_id tracking)
-8. Truncation detection flag
-9. [Differentiators] Dry-run mode, graceful shutdown, heartbeat, etc.
+1. System idle detection (ioreg HIDIdleTime) -- simplest, no permissions needed
+2. Process-level Teams detection (pgrep) -- simple, no permissions needed
+3. Configurable idle threshold + "always forward" config -- wire config before logic
+4. Fallback chain assembly (idle + process for now; AX slot prepared but empty)
+5. Status-aware gating logic (forward/suppress decision)
+6. Status metadata in webhook payload (extend existing builder)
+7. Teams AX status text reading (most complex, requires permission, may fail)
+8. Graceful AX degradation (handle permission denial, fall through)
+9. [Differentiators] Status caching, hysteresis, per-status rules, screen lock detection
 ```
 
 ## MVP Recommendation
 
-Prioritize (all table stakes, in dependency order):
+**Prioritize (in dependency order):**
 
-1. **macOS Sequoia DB path support** -- nothing works without it
-2. **Notification extraction** (sender, channel, message, timestamp) -- the core data
-3. **Teams bundle ID filtering + allowlist filtering** -- noise reduction
-4. **JSON config file** -- portability
-5. **Structured JSON payload + webhook POST** -- the output mechanism
-6. **State persistence** -- restart reliability
-7. **Truncation detection** -- low-cost, high-signal addition
+1. **System idle detection via HIDIdleTime** -- most reliable signal, zero permissions, zero dependencies, works immediately. This alone delivers 80% of the value: if the user is idle for 5+ minutes, forward notifications.
+2. **Process-level Teams detection** -- complements idle detection. If Teams is not running, always forward. Simple subprocess call.
+3. **Config additions** (idle threshold, always-forward escape hatch, per-status rules) -- wire configuration before building the logic that consumes it.
+4. **Fallback chain with status-aware gating** -- the core decision engine. Combine signals, produce a status, gate notifications based on it.
+5. **Status metadata in webhook payload** -- low-cost, high-value transparency for downstream consumers.
+6. **Teams AX status text reading** -- attempt to read actual Teams status. This is the highest-value signal but also the highest-risk. The new Teams client's AX tree exposure is uncertain. The menu bar extension is a potential target but unverified.
+7. **Graceful AX degradation** -- handle the case where AX reading fails or is not permitted.
 
-Defer to post-MVP:
-- **Notification type classification**: Needs real-world data on Teams notification text patterns before building reliable regex. Ship MVP, collect sample notifications, then build classification.
-- **Deduplication beyond rec_id**: Only build if duplicate notifications are observed in practice. Don't solve a theoretical problem.
-- **Startup replay window**: Useful but requires careful testing around time zone handling and DB timestamp formats. Add after state persistence is proven solid.
-- **Config reload without restart**: Nice-to-have. The tool restarts in under a second, so SIGHUP reload is a convenience, not a necessity.
-- **Health/heartbeat**: Add once the tool is running in production and monitoring becomes a real need.
+**Defer to post-MVP:**
 
-Build immediately but as polish, not blockers:
-- **Dry-run mode**: Trivial to implement (CLI flag + print instead of POST) and saves hours of debugging during initial setup. Include in MVP.
-- **Graceful shutdown**: A 5-line signal handler. Include in MVP.
+- **Screen lock detection**: Useful but requires calling into Core Graphics (not stdlib). Add after core gating works.
+- **macOS Focus/DND mode detection**: Supplementary signal. The idle time check already covers most "DND because away" scenarios. Add later for users who actively use Focus mode while present.
+- **Hysteresis / debounce**: Only build if users report flapping behavior in practice. The 5s poll interval already provides natural damping.
+- **Status check caching**: Only needed if status checks cause measurable performance impact. Profile first, optimize later.
+
+**Build immediately as polish:**
+
+- **Status change event logging**: Trivial to implement (one `logging.info()` call on status change). Essential for debugging status detection. Include from day one.
+
+## User Expectations for Status-Based Gating
+
+These are behaviors users expect from a presence-aware notification forwarder. Violating any of these will erode trust in the daemon.
+
+### Must-have behaviors
+
+| Expectation | Why | Implementation |
+|-------------|-----|----------------|
+| **Never miss a message when truly away** | This is the core promise. If the user is away from their Mac and a Teams message arrives, the webhook MUST fire. Missing a message is worse than sending a duplicate. | Default to "forward" on any ambiguous or error state. If status detection fails entirely, forward everything (fail-open). |
+| **Never send duplicates when at the computer** | If the user is actively using Teams, they see the notification in Teams AND receive a webhook. This creates annoying duplicates for downstream consumers (e.g., a phone notification they don't need). | Suppress webhooks when status is Available or when idle time is below threshold. But err toward forwarding if uncertain -- duplicates are annoying but not harmful. |
+| **Transparent about its decisions** | Users need to understand why a notification was or was not forwarded. "Magic" gating that silently drops messages is anxiety-inducing. | Status metadata in webhook payload. INFO-level logging of status transitions and gating decisions. --dry-run mode shows what would happen. |
+| **Quick to recognize "away"** | If the user walks away, the daemon should start forwarding within a reasonable time (5-10 minutes, not 30+). | 300s (5 min) idle threshold default matches Teams' own behavior. Configurable for users who want faster detection. |
+| **Quick to recognize "back"** | When the user returns and moves the mouse, stop forwarding immediately. Don't keep sending webhooks for 5 minutes after the user is back. | HIDIdleTime resets to 0 on any input. Next poll cycle (5s) detects the change. No delay beyond the poll interval. |
+| **Startup behavior: forward by default** | On daemon startup, before the first status check completes, the daemon should forward notifications (not suppress). This avoids a window where messages are silently dropped. | Initialize status as "unknown" which maps to "forward." First status check happens within one poll cycle. |
+
+### Nice-to-have behaviors
+
+| Expectation | Why | Implementation |
+|-------------|-----|----------------|
+| **Respect Teams "Do Not Disturb" status** | If the user set DND in Teams, they probably don't want ANY notifications forwarded. Some users will disagree (they want webhooks even in DND). Make it configurable. | DND maps to "suppress" by default in per-status rules. Config override available. |
+| **Handle sleep/wake correctly** | When the Mac sleeps, HIDIdleTime keeps incrementing. On wake, the user is "back" but idle time is very high. Must reset state on wake, not assume "very idle = very away." | HIDIdleTime resets on wake (mouse/keyboard required to unlock). Natural behavior handles this correctly. |
+| **Handle Teams quit/restart** | If Teams quits (update, crash) and restarts, the daemon should detect this and not assume "user is offline" during the restart window. | Brief absence of Teams process (< 60s) should not trigger status change. Debounce process detection. |
 
 ## Confidence Notes
 
 | Feature Category | Confidence | Rationale |
 |-----------------|------------|-----------|
-| Table stakes list | HIGH | Directly derived from PROJECT.md requirements + well-understood domain |
-| Allowlist filtering heuristics | MEDIUM | The "sender + body present" heuristic is sound, but exact noise patterns from Teams on Sequoia may vary. May need tuning after first run. |
-| Truncation detection threshold | MEDIUM | ~150 char limit is widely reported but may vary by Teams version or notification type. The heuristic approach (length + punctuation check) is pragmatic but imperfect. |
-| Notification type classification patterns | LOW | Teams notification text formats (how DMs vs channels vs mentions appear in subt/title/body) need real-world sample data to validate. Training data may be stale. |
-| Anti-features list | HIGH | Directly aligned with explicit out-of-scope items in PROJECT.md |
-| Feature dependencies | HIGH | Logical ordering based on data flow (extract -> filter -> format -> deliver -> persist) |
+| System idle detection (HIDIdleTime) | HIGH | Well-documented macOS API, confirmed working via ioreg on modern macOS. Known Karabiner-Elements edge case documented. |
+| Process-level Teams detection | HIGH | pgrep/subprocess is straightforward. Process naming for new Teams needs one-time runtime verification. |
+| Status-aware gating logic | HIGH | Straightforward decision logic. No external dependencies. Pattern is well-established in tools like Muzzle, DND automation. |
+| Teams AX status text (main window) | LOW | New Teams (WebView2/React) no longer exposes AX tree the same way as old Electron Teams. Multiple sources confirm the old method is broken. Must discover new element hierarchy. |
+| Teams menu bar extension AX reading | LOW | Menu bar extension is new (Nov 2024). Whether its AX description attribute contains useful status text is completely unverified. Requires runtime testing with Accessibility Inspector. |
+| Screen lock / DND detection | MEDIUM | Multiple documented approaches exist but macOS version-specific behavior (Sequoia) needs verification. |
+| Fallback chain pattern | HIGH | Established pattern in presence detection tools. Multiple successful implementations (macos-notification-state, TeamsStatusMacOS). |
+| User expectations | HIGH | Derived from common patterns in notification forwarding tools (Pushover quiet hours, Slack presence, Teams own behavior). Well-understood domain. |
 
 ## Sources
 
+- [Apple: Mac Automation Scripting Guide - UI Automation](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/AutomatetheUserInterface.html)
+- [Microsoft Community: New Teams AX tree issue](https://techcommunity.microsoft.com/discussions/teamsdeveloper/enable-accessibility-tree-on-macos-in-the-new-teams-work-or-school/4033014)
+- [GitHub: TeamsStatusMacOS - powerd-based status detection](https://github.com/RobertD502/TeamsStatusMacOS)
+- [GitHub: teams-call - Shell script for Teams call detection](https://github.com/mre/teams-call)
+- [GitHub: macos-notification-state - Native notification state detection](https://github.com/felixrieseberg/macos-notification-state)
+- [GitHub: Karabiner-Elements HIDIdleTime bug](https://github.com/pqrs-org/Karabiner-Elements/issues/385)
+- [Apple Developer Forums: HIDIdleTime not resetting](https://developer.apple.com/forums/thread/721530)
+- [DSSW: Inactivity and Idle Time on OS X](https://www.dssw.co.uk/blog/2015-01-21-inactivity-and-idle-time/)
+- [Microsoft: Teams Menu Bar Icon for Mac](https://websites.uta.edu/oit/2024/10/16/microsoft-teams-menu-bar-icon-for-mac-devices/)
+- [GitHub: Microsoft Teams AppleScripts](https://github.com/kpshek/microsoft-teams-applescripts)
+- [Microsoft: Stale presence status in Teams for Mac](https://learn.microsoft.com/en-us/troubleshoot/microsoftteams/teams-on-mac/incorrect-presence-status-teams-for-mac)
+- [GitHub: Microsoft Teams Presence Detector (archived)](https://github.com/EthyMoney/Microsoft-Teams-Presence-Detector)
+- [Automators Talk: Get current focus mode via script](https://talk.automators.fm/t/get-current-focus-mode-via-script/12423)
+- [XS-Labs: Detecting idle time with I/O Kit](https://xs-labs.com/en/archives/articles/iokit-idle-time/)
+- [GitHub: Idle time detection Python gist](https://gist.github.com/KingYes/da8b0f1b9f290d7378f4)
 - Project context: `~/Projects/macos-notification-intercept/.planning/PROJECT.md`
-- nchook architecture: [github.com/who23/nchook](https://github.com/who23/nchook) (referenced in PROJECT.md; not fetched due to tool restrictions)
-- macOS notification center DB structure: Training data knowledge (MEDIUM confidence -- macOS internals are well-documented in training data but Sequoia-specific changes may exist)
-- Teams notification patterns: Training data knowledge (MEDIUM confidence -- Teams notification format may have changed post-training-cutoff)
