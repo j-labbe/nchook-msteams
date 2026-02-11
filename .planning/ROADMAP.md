@@ -45,11 +45,11 @@ Plans:
   4. The daemon reads webhook URL, bundle IDs, poll interval, and log level from a JSON config file in the project directory
   5. When the webhook endpoint is unreachable or returns an error, the daemon logs the failure and continues processing the next notification (no hang, no crash)
   6. Subtitle (subt) field from Phase 1 extraction is included in the callback/webhook dispatch payload
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 02-01: TBD
-- [ ] 02-02: TBD
+- [ ] 02-01-PLAN.md -- Config loading, Teams filtering functions, notification classification, truncation detection
+- [ ] 02-02-PLAN.md -- Webhook delivery functions, event loop integration, startup summary update
 
 ### Phase 3: Operational Hardening
 **Goal**: The daemon is production-ready for sustained foreground operation with clean lifecycle management and a safe testing mode.
@@ -70,6 +70,6 @@ Phases execute in numeric order: 1 -> 2 -> 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. DB Watcher & State Engine | 0/2 | Planned | - |
-| 2. Teams Filtering & Webhook Delivery | 0/TBD | Not started | - |
+| 1. DB Watcher & State Engine | 2/2 | Complete | 2026-02-11 |
+| 2. Teams Filtering & Webhook Delivery | 0/2 | Planned | - |
 | 3. Operational Hardening | 0/TBD | Not started | - |
