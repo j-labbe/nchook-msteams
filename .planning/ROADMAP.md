@@ -20,7 +20,7 @@
 
 **Milestone Goal:** Only forward Teams notifications when the user is Away or Busy -- filter out notifications the user would see directly in Teams.
 
-- [ ] **Phase 4: Status Detection Core** — ioreg idle time, pgrep process check, fallback chain orchestrator
+- [x] **Phase 4: Status Detection Core** — ioreg idle time, pgrep process check, fallback chain orchestrator — completed 2026-02-11
 - [ ] **Phase 5: Config, Gating, and Event Loop Integration** — status gate wired into existing daemon with config toggle and payload metadata
 - [ ] **Phase 6: AX Discovery and Permission Handling** — AppleScript status reading, AX normalization, permission probing, graceful degradation
 
@@ -39,7 +39,7 @@
 **Plans**: 1 plan
 
 Plans:
-- [ ] 04-01-PLAN.md -- Signal functions (idle, process, AX stub) and fallback chain orchestrator
+- [x] 04-01-PLAN.md -- Signal functions (idle, process, AX stub) and fallback chain orchestrator
 
 ### Phase 5: Config, Gating, and Event Loop Integration
 **Goal**: Daemon uses detected status to gate notification forwarding -- forwarding on Away/Busy, suppressing on Available/Offline -- with config toggle, payload metadata, and correct rec_id advancement
@@ -80,6 +80,6 @@ Plans:
 | 1. DB Watcher & State Engine | v1.0 | 2/2 | Complete | 2026-02-11 |
 | 2. Teams Filtering & Webhook Delivery | v1.0 | 2/2 | Complete | 2026-02-11 |
 | 3. Operational Hardening | v1.0 | 1/1 | Complete | 2026-02-11 |
-| 4. Status Detection Core | v1.1 | 0/1 | Not started | - |
+| 4. Status Detection Core | v1.1 | 1/1 | Complete | 2026-02-11 |
 | 5. Config, Gating, and Event Loop Integration | v1.1 | 0/? | Not started | - |
 | 6. AX Discovery and Permission Handling | v1.1 | 0/? | Not started | - |

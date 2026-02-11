@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-02-11)
 
 **Core value:** Reliably capture every Teams message notification and deliver it as structured JSON to a webhook -- no missed messages, no noise.
-**Current focus:** Phase 4 -- Status Detection Core
+**Current focus:** Phase 5 -- Config, Gating, and Event Loop Integration
 
 ## Current Position
 
-Phase: 4 of 6 (Status Detection Core)
-Plan: 1 of 1 in current phase -- COMPLETE
-Status: Phase 4 complete
-Last activity: 2026-02-11 -- Phase 4 status detection core executed
+Phase: 5 of 6 (Config, Gating, and Event Loop Integration)
+Plan: 0 of ? in current phase
+Status: Ready to plan
+Last activity: 2026-02-11 -- Phase 4 complete, verified 5/5 must-haves
 
 Progress: [██████░░░░] 60% (6/10 plans across all milestones; v1.1: 33%)
 
@@ -56,5 +56,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-11
-Stopped at: Completed 04-01-PLAN.md -- Phase 4 complete, ready for Phase 5
+Stopped at: Phase 4 verified and complete -- Phase 5 ready to plan
 Resume file: None
