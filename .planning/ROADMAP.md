@@ -58,10 +58,10 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. Sending SIGINT or SIGTERM to the daemon causes it to flush state to disk and exit cleanly (no data loss, no zombie process)
   2. Running the daemon with --dry-run prints the JSON payloads that would be sent to the webhook without actually making HTTP requests
-**Plans**: TBD
+**Plans**: 1 plan
 
 Plans:
-- [ ] 03-01: TBD
+- [ ] 03-01-PLAN.md -- Graceful signal handling, --dry-run CLI flag, post-loop state flush
 
 ## Progress
 
@@ -72,4 +72,4 @@ Phases execute in numeric order: 1 -> 2 -> 3
 |-------|----------------|--------|-----------|
 | 1. DB Watcher & State Engine | 2/2 | Complete | 2026-02-11 |
 | 2. Teams Filtering & Webhook Delivery | 2/2 | Complete | 2026-02-11 |
-| 3. Operational Hardening | 0/TBD | Not started | - |
+| 3. Operational Hardening | 0/1 | Not started | - |
