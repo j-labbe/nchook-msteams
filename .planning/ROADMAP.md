@@ -12,8 +12,8 @@ This roadmap delivers a macOS daemon that intercepts Teams notifications from th
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: DB Watcher & State Engine** - Patched nchook that reliably watches Sequoia DB, extracts all fields, persists state, and validates the environment
-- [ ] **Phase 2: Teams Filtering & Webhook Delivery** - Wrapper that filters to Teams messages, constructs JSON payloads, and delivers to webhook
+- [x] **Phase 1: DB Watcher & State Engine** - Patched nchook that reliably watches Sequoia DB, extracts all fields, persists state, and validates the environment
+- [x] **Phase 2: Teams Filtering & Webhook Delivery** - Wrapper that filters to Teams messages, constructs JSON payloads, and delivers to webhook
 - [ ] **Phase 3: Operational Hardening** - Graceful shutdown, dry-run mode, and end-to-end production readiness
 
 ## Phase Details
@@ -48,8 +48,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 02-01-PLAN.md -- Config loading, Teams filtering functions, notification classification, truncation detection
-- [ ] 02-02-PLAN.md -- Webhook delivery functions, event loop integration, startup summary update
+- [x] 02-01-PLAN.md -- Config loading, Teams filtering functions, notification classification, truncation detection
+- [x] 02-02-PLAN.md -- Webhook delivery functions, event loop integration, startup summary update
 
 ### Phase 3: Operational Hardening
 **Goal**: The daemon is production-ready for sustained foreground operation with clean lifecycle management and a safe testing mode.
@@ -71,5 +71,5 @@ Phases execute in numeric order: 1 -> 2 -> 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. DB Watcher & State Engine | 2/2 | Complete | 2026-02-11 |
-| 2. Teams Filtering & Webhook Delivery | 0/2 | Planned | - |
+| 2. Teams Filtering & Webhook Delivery | 2/2 | Complete | 2026-02-11 |
 | 3. Operational Hardening | 0/TBD | Not started | - |
