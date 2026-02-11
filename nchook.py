@@ -599,6 +599,92 @@ def post_webhook(payload, webhook_url, timeout=10):
 
 
 # ---------------------------------------------------------------------------
+# Status Detection
+# ---------------------------------------------------------------------------
+
+def _detect_idle_time():
+    """
+    STAT-01: Detect system idle time via ioreg HIDIdleTime.
+
+    Returns idle time in seconds (float), or None if detection fails.
+    """
+    try:
+        result = subprocess.run(
+            ["ioreg", "-c", "IOHIDSystem", "-d", "4"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        logging.warning("ioreg timed out")
+        return None
+    except FileNotFoundError:
+        logging.error("ioreg not found")
+        return None
+
+    if result.returncode != 0:
+        logging.warning("ioreg returned non-zero exit code: %d", result.returncode)
+        return None
+
+    match = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', result.stdout)
+    if not match:
+        logging.warning("HIDIdleTime not found in ioreg output")
+        return None
+
+    nanoseconds = int(match.group(1))
+    return nanoseconds / 1_000_000_000  # convert nanoseconds to seconds
+
+
+def _detect_teams_process():
+    """
+    STAT-02: Detect whether Microsoft Teams is running via pgrep.
+
+    Checks "MSTeams" first (new Teams), then "Microsoft Teams" (legacy)
+    for backward compatibility.
+
+    Returns True if Teams is running, False otherwise.
+    """
+    for process_name in ["MSTeams", "Microsoft Teams"]:
+        try:
+            result = subprocess.run(
+                ["pgrep", "-x", process_name],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+    return False
+
+
+def _detect_status_ax():
+    """Placeholder for AX status detection (Phase 6). Always returns None."""
+    return None
+
+
+_AX_STATUS_MAP = {
+    "available": "Available",
+    "busy": "Busy",
+    "do not disturb": "DoNotDisturb",
+    "in a meeting": "Busy",
+    "in a call": "Busy",
+    "presenting": "Busy",
+    "away": "Away",
+    "be right back": "BeRightBack",
+    "appear offline": "Offline",
+    "offline": "Offline",
+    "out of office": "Offline",
+}
+
+
+def _normalize_ax_status(raw):
+    """STAT-04 prep: Normalize raw AX status text to canonical status value."""
+    return _AX_STATUS_MAP.get(raw.lower().strip(), "Unknown")
+
+
+# ---------------------------------------------------------------------------
 # kqueue WAL Watcher
 # ---------------------------------------------------------------------------
 
