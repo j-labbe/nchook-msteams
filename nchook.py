@@ -684,6 +684,68 @@ def _normalize_ax_status(raw):
     return _AX_STATUS_MAP.get(raw.lower().strip(), "Unknown")
 
 
+def detect_user_status(config):
+    """
+    Three-signal fallback chain producing canonical status result.
+
+    Signal priority: AX (Phase 6) -> idle time -> process check.
+    Each signal function returns a value or None. None means "try next signal."
+
+    Returns dict with exactly three keys:
+      detected_status: Available | Away | Offline | Unknown
+      status_source: ax | idle | process | error
+      status_confidence: high | medium | low
+    """
+    idle_threshold = config.get("idle_threshold_seconds", 300)
+
+    # Signal 1: AX status text (placeholder -- always None until Phase 6)
+    ax_status = _detect_status_ax()
+    if ax_status is not None:
+        return {
+            "detected_status": _normalize_ax_status(ax_status),
+            "status_source": "ax",
+            "status_confidence": "high",
+        }
+
+    # Signal 2: System idle time
+    idle_seconds = _detect_idle_time()
+    if idle_seconds is not None:
+        if idle_seconds >= idle_threshold:
+            return {
+                "detected_status": "Away",
+                "status_source": "idle",
+                "status_confidence": "medium",
+            }
+        # User is active (idle < threshold). Check Teams process to distinguish
+        # Available (Teams running) from Offline (Teams not running).
+        if _detect_teams_process():
+            return {
+                "detected_status": "Available",
+                "status_source": "idle",
+                "status_confidence": "medium",
+            }
+        return {
+            "detected_status": "Offline",
+            "status_source": "process",
+            "status_confidence": "high",
+        }
+
+    # Signal 3: Process check only (idle signal failed)
+    if not _detect_teams_process():
+        return {
+            "detected_status": "Offline",
+            "status_source": "process",
+            "status_confidence": "high",
+        }
+
+    # All signals failed or inconclusive -- Teams running but idle unknown
+    return {
+        "detected_status": "Unknown",
+        "status_source": "error",
+        "status_confidence": "low",
+    }
+
+
 # ---------------------------------------------------------------------------
 # kqueue WAL Watcher
 # ---------------------------------------------------------------------------
