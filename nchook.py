@@ -353,6 +353,17 @@ def print_startup_summary(db_path, last_rec_id, config=None, dry_run=False):
         logging.info("  Bundle IDs:  %s", ", ".join(sorted(config.get("bundle_ids", []))))
         logging.info("  Poll interval: %.1fs", config.get("poll_interval", POLL_FALLBACK_SECONDS))
         logging.info("  Log level:   %s", config.get("log_level", "INFO"))
+        # v1.1: Status detection info (INTG-03)
+        status_enabled = config.get("status_enabled", True)
+        logging.info("  Status gate: %s", "ENABLED" if status_enabled else "DISABLED")
+        if status_enabled:
+            status_result = detect_user_status(config)
+            logging.info(
+                "  Current status: %s (source=%s, confidence=%s)",
+                status_result["detected_status"],
+                status_result["status_source"],
+                status_result["status_confidence"],
+            )
     if dry_run:
         logging.info("  Mode:        DRY-RUN (no HTTP requests)")
     logging.info("=" * 60)
@@ -368,6 +379,9 @@ DEFAULT_CONFIG = {
     "poll_interval": 5.0,
     "log_level": "INFO",
     "webhook_timeout": 10,
+    # v1.1 status detection
+    "status_enabled": True,
+    "idle_threshold_seconds": 300,
 }
 
 
@@ -544,12 +558,15 @@ def detect_truncation(body):
 # Webhook Delivery
 # ---------------------------------------------------------------------------
 
-def build_webhook_payload(notif, msg_type):
+def build_webhook_payload(notif, msg_type, status_result=None):
     """
     WEBH-02, DBWT-06: Build JSON-serializable webhook payload from notification.
 
+    INTG-02: When status_result is provided, includes _detected_status,
+    _status_source, and _status_confidence metadata fields.
+
     Returns dict with: senderName, chatId, content, timestamp, type,
-    subtitle, _source, _truncated.
+    subtitle, _source, _truncated, and optionally status metadata.
     """
     ts = notif.get("timestamp", 0)
     if ts > 0:
@@ -557,7 +574,7 @@ def build_webhook_payload(notif, msg_type):
     else:
         ts_formatted = None
 
-    return {
+    payload = {
         "senderName": notif.get("title", ""),
         "chatId": notif.get("subtitle", ""),
         "content": notif.get("body", ""),
@@ -567,6 +584,14 @@ def build_webhook_payload(notif, msg_type):
         "_source": "macos-notification-center",
         "_truncated": detect_truncation(notif.get("body", "")),
     }
+
+    # v1.1: Status metadata (INTG-02)
+    if status_result is not None:
+        payload["_detected_status"] = status_result["detected_status"]
+        payload["_status_source"] = status_result["status_source"]
+        payload["_status_confidence"] = status_result["status_confidence"]
+
+    return payload
 
 
 def post_webhook(payload, webhook_url, timeout=10):
@@ -744,6 +769,29 @@ def detect_user_status(config):
         "status_source": "error",
         "status_confidence": "low",
     }
+
+
+# ---------------------------------------------------------------------------
+# Status Gating
+# ---------------------------------------------------------------------------
+
+_FORWARD_STATUSES = frozenset({"Away", "Busy", "Unknown"})
+
+
+def should_forward_status(status_result, config):
+    """
+    Decide whether to forward notifications based on detected status.
+
+    GATE-01: Forward on Away or Busy. Suppress on Available, Offline,
+             DoNotDisturb, or BeRightBack.
+    GATE-02: Forward on Unknown (fail-open policy).
+    INTG-01: When status_enabled is False, always forward (v1.0 behavior).
+
+    Returns True to forward, False to suppress.
+    """
+    if not config.get("status_enabled", True):
+        return True
+    return status_result["detected_status"] in _FORWARD_STATUSES
 
 
 # ---------------------------------------------------------------------------
