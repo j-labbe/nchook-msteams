@@ -25,6 +25,7 @@ import argparse
 import urllib.request
 import urllib.error
 import re
+import ctypes
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -364,6 +365,19 @@ def print_startup_summary(db_path, last_rec_id, config=None, dry_run=False):
                 status_result["status_source"],
                 status_result["status_confidence"],
             )
+            # v1.1 Phase 6: AX permission status and actionable instructions
+            global _ax_available
+            _ax_available = _check_ax_permission()
+            if _ax_available:
+                logging.info("  AX status:   AVAILABLE (Accessibility permission granted)")
+            else:
+                logging.info("  AX status:   NOT AVAILABLE (Accessibility permission not granted)")
+                app_name = _get_terminal_app_name()
+                logging.info("  To enable AX-based status detection:")
+                logging.info("    1. Open System Settings > Privacy & Security > Accessibility")
+                logging.info("    2. Click the + button and add: %s", app_name)
+                logging.info("    3. Restart the daemon")
+                logging.info("  Without AX, status detection falls back to idle+process signals.")
     if dry_run:
         logging.info("  Mode:        DRY-RUN (no HTTP requests)")
     logging.info("=" * 60)
@@ -626,6 +640,58 @@ def post_webhook(payload, webhook_url, timeout=10):
 # ---------------------------------------------------------------------------
 # Status Detection
 # ---------------------------------------------------------------------------
+
+def _check_ax_permission():
+    """
+    INTG-04: Check if current process has macOS Accessibility permission.
+
+    Uses AXIsProcessTrusted() from ApplicationServices framework via ctypes.
+    Returns True if permission granted, False otherwise.
+    Returns False on any error (safe fallback).
+    """
+    try:
+        lib = ctypes.cdll.LoadLibrary(
+            '/System/Library/Frameworks/ApplicationServices.framework'
+            '/ApplicationServices'
+        )
+        lib.AXIsProcessTrusted.restype = ctypes.c_bool
+        lib.AXIsProcessTrusted.argtypes = []
+        return lib.AXIsProcessTrusted()
+    except (OSError, AttributeError):
+        return False
+
+
+# Module-level AX permission cache. Set once at startup via print_startup_summary().
+# macOS requires a process restart for TCC permission changes to take effect on a
+# running process, so this value is valid for the entire process lifetime.
+_ax_available = None
+
+# Consecutive AX query failure counter. Used by _detect_status_ax() safety net.
+_ax_consecutive_failures = 0
+
+# After this many consecutive osascript failures, AX self-disables for the session.
+_AX_MAX_FAILURES = 3
+
+
+def _get_terminal_app_name():
+    """
+    INTG-04: Get user-friendly name of the terminal app that needs AX permission.
+
+    Reads TERM_PROGRAM env var and maps known values to user-friendly names.
+    Returns the mapped name, the raw value, or a generic fallback.
+    """
+    terminal = os.environ.get("TERM_PROGRAM", "")
+    names = {
+        "Apple_Terminal": "Terminal.app",
+        "iTerm.app": "iTerm2",
+        "Alacritty": "Alacritty",
+        "WezTerm": "WezTerm",
+        "WarpTerminal": "Warp",
+        "vscode": "Visual Studio Code",
+        "tmux": "your terminal application (tmux session host)",
+    }
+    return names.get(terminal, terminal or "your terminal application")
+
 
 def _detect_idle_time():
     """
