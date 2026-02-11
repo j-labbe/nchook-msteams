@@ -51,11 +51,10 @@ Plans:
   3. When status is Unknown (all signals failed), notifications are forwarded (fail-open policy)
   4. Setting `status_enabled: false` in config.json disables all gating -- every notification forwards as in v1.0
   5. Startup summary displays whether status detection is enabled and the current detected status
-**Plans**: TBD
+**Plans**: 1 plan
 
 Plans:
-- [ ] 05-01: TBD
-- [ ] 05-02: TBD
+- [ ] 05-01-PLAN.md -- Gate function, config defaults, payload metadata, startup display, and event loop integration
 
 ### Phase 6: AX Discovery and Permission Handling
 **Goal**: Daemon can read Teams status text directly from the Accessibility tree when permission is granted, and degrades gracefully to idle+process fallback when it is not
@@ -81,5 +80,5 @@ Plans:
 | 2. Teams Filtering & Webhook Delivery | v1.0 | 2/2 | Complete | 2026-02-11 |
 | 3. Operational Hardening | v1.0 | 1/1 | Complete | 2026-02-11 |
 | 4. Status Detection Core | v1.1 | 1/1 | Complete | 2026-02-11 |
-| 5. Config, Gating, and Event Loop Integration | v1.1 | 0/? | Not started | - |
+| 5. Config, Gating, and Event Loop Integration | v1.1 | 0/1 | Not started | - |
 | 6. AX Discovery and Permission Handling | v1.1 | 0/? | Not started | - |
