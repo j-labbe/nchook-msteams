@@ -752,9 +752,14 @@ def _detect_teams_process():
 
 def _detect_status_ax():
     """
-    STAT-03: Read Teams status text from Accessibility tree via osascript.
+    STAT-03: Read Teams status text via the menu bar status menu.
+
+    Opens the Teams status menu in the macOS menu bar, reads the title of
+    the first menu item (the current status), then closes the menu. The
+    menu flashes briefly on screen.
 
     Returns raw status text string (e.g., "Busy", "Away") or None on failure.
+    Returns None for unrecognized text so the fallback chain continues.
     None causes the fallback chain in detect_user_status() to proceed to
     idle+process signals. Never raises exceptions.
 
@@ -762,8 +767,8 @@ def _detect_status_ax():
     (cached at startup via _ax_available).
 
     Safety net: after _AX_MAX_FAILURES consecutive failures, self-disables
-    for the remainder of the session to avoid wasting 3s per poll cycle on
-    a broken AX tree.
+    for the remainder of the session to avoid wasting time per poll cycle
+    on a broken AX tree.
     """
     global _ax_available, _ax_consecutive_failures
 
@@ -773,33 +778,26 @@ def _detect_status_ax():
     if not _ax_available:
         return None
 
-    # AppleScript to read Teams status via System Events.
-    # Tries two candidate paths:
-    # 1. Menu bar item description (Teams menu bar extension, late 2024+)
-    # 2. First static text of the main window (legacy fallback)
-    # The script returns the first non-empty result or empty string.
+    # AppleScript to read Teams status via the menu bar status menu.
+    # Clicks the Teams status menu icon, reads the title of the first menu
+    # item (which is the current status, e.g., "Available", "Busy"), then
+    # presses Escape to close the menu. The menu flashes briefly.
     script = '''
 try
     tell application "System Events"
         tell process "MSTeams"
-            -- Candidate 1: Menu bar extension status (most promising for new Teams)
-            try
-                set statusText to description of menu bar item 1 of menu bar 2
-                if statusText is not "" and statusText is not missing value then
-                    return statusText
-                end if
-            end try
-            -- Candidate 2: Window title or status area
-            try
-                set statusText to value of static text 1 of group 1 of group 1 of window 1
-                if statusText is not "" and statusText is not missing value then
-                    return statusText
-                end if
-            end try
+            click menu bar item 1 of menu bar 2
+            delay 0.3
+            set statusText to title of menu item 1 of menu 1 of menu bar item 1 of menu bar 2
+            key code 53 -- Escape to close menu
+            return statusText
         end tell
     end tell
-    return ""
 on error errMsg number errNum
+    -- Ensure menu is closed on error
+    try
+        tell application "System Events" to key code 53
+    end try
     return ""
 end try
 '''
@@ -836,6 +834,23 @@ end try
                 _ax_available = False
             return None
 
+        # Validate raw text is a recognized status before accepting.
+        # Unrecognized text (e.g., "status menu") should fall through
+        # to idle+process signals rather than returning Unknown with
+        # high confidence.
+        if raw.lower().strip() not in _AX_STATUS_MAP:
+            logging.debug("AX returned unrecognized text: %r", raw)
+            _ax_consecutive_failures += 1
+            if _ax_consecutive_failures >= _AX_MAX_FAILURES:
+                logging.info(
+                    "AX query returned unrecognized text %d consecutive times; "
+                    "disabling AX for this session. "
+                    "Falling back to idle+process signals.",
+                    _ax_consecutive_failures,
+                )
+                _ax_available = False
+            return None
+
         # Success -- reset failure counter and return raw text
         _ax_consecutive_failures = 0
         return raw
@@ -865,7 +880,8 @@ _AX_STATUS_MAP = {
     "in a call": "Busy",
     "presenting": "Busy",
     "away": "Away",
-    "be right back": "BeRightBack",
+    "be right back": "Away",
+    "appear away": "Away",
     "appear offline": "Offline",
     "offline": "Offline",
     "out of office": "Offline",
@@ -891,7 +907,7 @@ def detect_user_status(config):
     """
     idle_threshold = config.get("idle_threshold_seconds", 300)
 
-    # Signal 1: AX status text (placeholder -- always None until Phase 6)
+    # Signal 1: AX status text (reads Teams menu bar status menu)
     ax_status = _detect_status_ax()
     if ax_status is not None:
         return {
@@ -943,7 +959,7 @@ def detect_user_status(config):
 # Status Gating
 # ---------------------------------------------------------------------------
 
-_FORWARD_STATUSES = frozenset({"Away", "Busy", "Unknown"})
+_FORWARD_STATUSES = frozenset({"Away", "Unknown"})
 
 
 def should_forward_status(status_result, config):
