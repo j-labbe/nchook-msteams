@@ -26,6 +26,8 @@ import urllib.request
 import urllib.error
 import re
 import ctypes
+import struct
+import zlib
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -365,15 +367,17 @@ def print_startup_summary(db_path, last_rec_id, config=None, dry_run=False):
                 status_result["status_source"],
                 status_result["status_confidence"],
             )
-            # v1.1 Phase 6: AX permission status and actionable instructions
+            # AX + icon color permission status and actionable instructions
             global _ax_available
             _ax_available = _check_ax_permission()
             if _ax_available:
                 logging.info("  AX status:   AVAILABLE (Accessibility permission granted)")
+                logging.info("  Icon color:  ENABLED (non-intrusive status via menu bar icon color)")
             else:
                 logging.info("  AX status:   NOT AVAILABLE (Accessibility permission not granted)")
+                logging.info("  Icon color:  DISABLED (requires Accessibility permission)")
                 app_name = _get_terminal_app_name()
-                logging.info("  To enable AX-based status detection:")
+                logging.info("  To enable icon-color status detection:")
                 logging.info("    1. Open System Settings > Privacy & Security > Accessibility")
                 logging.info("    2. Click the + button and add: %s", app_name)
                 logging.info("    3. Restart the daemon")
@@ -750,6 +754,347 @@ def _detect_teams_process():
     return False
 
 
+# ---------------------------------------------------------------------------
+# Icon Color Status Detection (non-intrusive)
+# ---------------------------------------------------------------------------
+
+# Consecutive icon-color detection failure counter. After this many failures
+# in a row, icon-color detection self-disables for the session.
+_icon_consecutive_failures = 0
+_ICON_MAX_FAILURES = 5
+
+
+def _get_icon_rect():
+    """
+    Get the screen position and size of the Teams menu bar icon.
+
+    Uses Accessibility (System Events) to read the position and size
+    attributes of the Teams menu bar item without clicking it.
+
+    Returns (x, y, w, h) tuple or None on failure.
+    """
+    script = '''
+try
+    tell application "System Events"
+        tell process "MSTeams"
+            set mbItem to menu bar item 1 of menu bar 2
+            set pos to position of mbItem
+            set sz to size of mbItem
+            return (item 1 of pos as text) & "," & (item 2 of pos as text) & "," & (item 1 of sz as text) & "," & (item 2 of sz as text)
+        end tell
+    end tell
+on error
+    return ""
+end try
+'''
+    try:
+        result = subprocess.run(
+            ['osascript', '-e', script],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        parts = result.stdout.strip().split(',')
+        if len(parts) != 4:
+            return None
+        return tuple(int(float(p.strip())) for p in parts)
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        return None
+
+
+def _capture_icon_region(rect):
+    """
+    Capture the menu bar icon region as PNG file data.
+
+    Uses macOS screencapture with -R flag to grab just the icon rectangle.
+    The -x flag suppresses the camera shutter sound.
+
+    Note: may require Screen Recording permission on macOS 14+.
+
+    Returns PNG bytes or None on failure. Cleans up temp file.
+    """
+    x, y, w, h = rect
+    tmp_path = os.path.join(tempfile.gettempdir(), 'nchook_teams_icon.png')
+    try:
+        result = subprocess.run(
+            ['screencapture', '-x', '-R', f'{x},{y},{w},{h}', tmp_path],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode != 0:
+            logging.debug("screencapture failed (exit %d): %s",
+                         result.returncode, result.stderr.strip())
+            return None
+        with open(tmp_path, 'rb') as f:
+            data = f.read()
+        if len(data) < 50:
+            logging.debug("screencapture produced suspiciously small file (%d bytes)", len(data))
+            return None
+        return data
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        logging.debug("Icon capture error: %s", e)
+        return None
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _paeth_predictor(a, b, c):
+    """PNG Paeth filter predictor function."""
+    p = a + b - c
+    pa = abs(p - a)
+    pb = abs(p - b)
+    pc = abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    if pb <= pc:
+        return b
+    return c
+
+
+def _parse_png_pixels(data):
+    """
+    Parse a PNG file into RGB pixel data.
+
+    Handles RGBA (color type 6) and RGB (color type 2) PNGs with 8-bit
+    depth and all five PNG filter types. These are the formats produced
+    by macOS screencapture.
+
+    Returns (width, height, [(r,g,b), ...]) or None on any parse error.
+    """
+    if data[:8] != b'\x89PNG\r\n\x1a\n':
+        return None
+
+    pos = 8
+    width = height = bit_depth = color_type = None
+    idat_chunks = []
+
+    while pos + 12 <= len(data):
+        length = struct.unpack('>I', data[pos:pos + 4])[0]
+        chunk_type = data[pos + 4:pos + 8]
+        chunk_data = data[pos + 8:pos + 8 + length]
+
+        if chunk_type == b'IHDR':
+            if len(chunk_data) < 10:
+                return None
+            width, height, bit_depth, color_type = struct.unpack(
+                '>IIBB', chunk_data[:10]
+            )
+        elif chunk_type == b'IDAT':
+            idat_chunks.append(chunk_data)
+        elif chunk_type == b'IEND':
+            break
+
+        pos += 12 + length
+
+    if width is None or not idat_chunks or bit_depth != 8:
+        return None
+
+    if color_type == 6:     # RGBA
+        bpp = 4
+    elif color_type == 2:   # RGB
+        bpp = 3
+    else:
+        return None
+
+    try:
+        raw = zlib.decompress(b''.join(idat_chunks))
+    except zlib.error:
+        return None
+
+    stride = 1 + width * bpp
+    if len(raw) < height * stride:
+        return None
+
+    pixels = []
+    prev_row = bytearray(width * bpp)
+
+    for y in range(height):
+        row_start = y * stride
+        filter_type = raw[row_start]
+        row = bytearray(raw[row_start + 1:row_start + stride])
+
+        if filter_type == 1:      # Sub
+            for i in range(bpp, len(row)):
+                row[i] = (row[i] + row[i - bpp]) & 0xFF
+        elif filter_type == 2:    # Up
+            for i in range(len(row)):
+                row[i] = (row[i] + prev_row[i]) & 0xFF
+        elif filter_type == 3:    # Average
+            for i in range(len(row)):
+                left = row[i - bpp] if i >= bpp else 0
+                row[i] = (row[i] + (left + prev_row[i]) // 2) & 0xFF
+        elif filter_type == 4:    # Paeth
+            for i in range(len(row)):
+                left = row[i - bpp] if i >= bpp else 0
+                up_left = prev_row[i - bpp] if i >= bpp else 0
+                row[i] = (row[i] + _paeth_predictor(
+                    left, prev_row[i], up_left
+                )) & 0xFF
+
+        prev_row = row
+
+        for x in range(width):
+            offset = x * bpp
+            pixels.append((row[offset], row[offset + 1], row[offset + 2]))
+
+    return width, height, pixels
+
+
+def _rgb_to_hsv(r, g, b):
+    """Convert RGB (0-255) to HSV (h: 0-360, s: 0-1, v: 0-1)."""
+    r, g, b = r / 255.0, g / 255.0, b / 255.0
+    mx = max(r, g, b)
+    mn = min(r, g, b)
+    diff = mx - mn
+
+    if diff == 0:
+        h = 0
+    elif mx == r:
+        h = (60 * ((g - b) / diff) + 360) % 360
+    elif mx == g:
+        h = (60 * ((b - r) / diff) + 120) % 360
+    else:
+        h = (60 * ((r - g) / diff) + 240) % 360
+
+    s = 0 if mx == 0 else diff / mx
+    return h, s, mx
+
+
+_ICON_COLOR_STATUS_MAP = {
+    "green": "Available",
+    "yellow": "Away",       # Away or Be Right Back
+    "red": "Busy",          # Busy, DND, In a Meeting, In a Call, Presenting
+}
+
+
+def _classify_icon_color(width, height, pixels):
+    """
+    Classify the Teams status based on icon pixel color analysis.
+
+    The Teams menu bar icon is a monochrome template image with a small
+    colored status indicator dot. We scan for saturated pixels (the dot)
+    among the mostly-monochrome icon. The dominant hue of saturated pixels
+    determines the status.
+
+    Returns canonical status string or None if no clear indicator found.
+    """
+    color_counts = {"green": 0, "yellow": 0, "red": 0}
+
+    for r, g, b in pixels:
+        h, s, v = _rgb_to_hsv(r, g, b)
+
+        # Only consider clearly saturated, reasonably bright pixels.
+        # Filters out the monochrome icon body, menu bar background,
+        # and dark/shadow pixels — leaving just the status dot.
+        if s < 0.35 or v < 0.25:
+            continue
+
+        if 75 <= h <= 165:          # Green range
+            color_counts["green"] += 1
+        elif 25 <= h < 75:          # Yellow/amber range
+            color_counts["yellow"] += 1
+        elif h < 25 or h > 330:     # Red range (wraps around 0°)
+            color_counts["red"] += 1
+        # Other hues (blue/purple from icon chrome) are ignored
+
+    dominant = max(color_counts, key=color_counts.get)
+    count = color_counts[dominant]
+
+    # Require a minimum pixel count. The status dot is small but should
+    # produce at least a handful of saturated pixels even at low resolution.
+    min_pixels = 6
+    if count < min_pixels:
+        logging.debug(
+            "Icon color: insufficient dominant pixels (%d %s, need %d). "
+            "Breakdown: %s",
+            count, dominant, min_pixels, color_counts,
+        )
+        return None
+
+    logging.debug(
+        "Icon color detected: %s (%d pixels, breakdown: %s)",
+        dominant, count, color_counts,
+    )
+    return _ICON_COLOR_STATUS_MAP.get(dominant)
+
+
+def _detect_status_icon_color():
+    """
+    Detect Teams status by analyzing the color of the menu bar icon.
+
+    Non-intrusive: reads the icon's screen position via AX attributes
+    (no click), captures a screenshot of just that region, and analyzes
+    pixel colors to determine the status indicator dot color.
+
+    Returns canonical status string (Available/Away/Busy) or None.
+    Cannot detect Offline (no colored dot) — falls through to idle+process.
+
+    Self-disables after _ICON_MAX_FAILURES consecutive failures.
+    """
+    global _ax_available, _icon_consecutive_failures
+
+    # Permission gate: AX needed to read menu bar item position
+    if _ax_available is None:
+        _ax_available = _check_ax_permission()
+    if not _ax_available:
+        return None
+
+    # Self-disable check
+    if _icon_consecutive_failures >= _ICON_MAX_FAILURES:
+        return None
+
+    rect = _get_icon_rect()
+    if rect is None:
+        logging.debug("Icon color: failed to get menu bar icon position")
+        _icon_consecutive_failures += 1
+        if _icon_consecutive_failures >= _ICON_MAX_FAILURES:
+            logging.info(
+                "Icon color detection failed %d consecutive times (position); "
+                "disabling for this session.",
+                _icon_consecutive_failures,
+            )
+        return None
+
+    logging.debug("Icon rect: x=%d y=%d w=%d h=%d", *rect)
+
+    png_data = _capture_icon_region(rect)
+    if png_data is None:
+        _icon_consecutive_failures += 1
+        if _icon_consecutive_failures >= _ICON_MAX_FAILURES:
+            logging.info(
+                "Icon color detection failed %d consecutive times (capture); "
+                "disabling for this session.",
+                _icon_consecutive_failures,
+            )
+        return None
+
+    parsed = _parse_png_pixels(png_data)
+    if parsed is None:
+        logging.debug("Icon color: failed to parse captured PNG")
+        _icon_consecutive_failures += 1
+        return None
+
+    width, height, pixels = parsed
+    logging.debug("Icon image: %dx%d (%d pixels)", width, height, len(pixels))
+
+    status = _classify_icon_color(width, height, pixels)
+    if status is None:
+        _icon_consecutive_failures += 1
+        if _icon_consecutive_failures >= _ICON_MAX_FAILURES:
+            logging.info(
+                "Icon color detection failed %d consecutive times (classification); "
+                "disabling for this session.",
+                _icon_consecutive_failures,
+            )
+        return None
+
+    # Success — reset failure counter
+    _icon_consecutive_failures = 0
+    return status
+
+
 def _detect_status_ax():
     """
     STAT-03: Read Teams status text via the menu bar status menu.
@@ -895,24 +1240,31 @@ def _normalize_ax_status(raw):
 
 def detect_user_status(config):
     """
-    Three-signal fallback chain producing canonical status result.
+    Fallback chain producing canonical status result.
 
-    Signal priority: AX (Phase 6) -> idle time -> process check.
-    Each signal function returns a value or None. None means "try next signal."
+    Signal priority:
+      1. Icon color (non-intrusive screenshot of menu bar icon)
+      2. System idle time + process check
+      3. Process check only
+      4. Unknown (fail-open)
+
+    The AX click method (_detect_status_ax) is preserved in the codebase
+    but no longer called here — icon color detection replaces it as the
+    primary high-confidence signal without UI interruption.
 
     Returns dict with exactly three keys:
-      detected_status: Available | Away | Offline | Unknown
-      status_source: ax | idle | process | error
+      detected_status: Available | Away | Busy | Offline | Unknown
+      status_source: icon_color | idle | process | error
       status_confidence: high | medium | low
     """
     idle_threshold = config.get("idle_threshold_seconds", 300)
 
-    # Signal 1: AX status text (reads Teams menu bar status menu)
-    ax_status = _detect_status_ax()
-    if ax_status is not None:
+    # Signal 1: Icon color analysis (non-intrusive, no clicking)
+    icon_status = _detect_status_icon_color()
+    if icon_status is not None:
         return {
-            "detected_status": _normalize_ax_status(ax_status),
-            "status_source": "ax",
+            "detected_status": icon_status,
+            "status_source": "icon_color",
             "status_confidence": "high",
         }
 
